@@ -284,3 +284,123 @@ def test_login_redirect_flow(monkeypatch):
     next(b for b in app.button if b.label == "Connect to Kite").click().run()
     assert not app.exception
     assert client.token == "generated_token"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "one_time_request",
+        "?request_token=one_time_request&status=success",
+        "request_token=one_time_request&status=success",
+        "http://localhost:8501/?request_token=one_time_request&status=success",
+    ],
+)
+def test_request_token_formats(value):
+    from frontend.kite_download import extract_request_token
+
+    assert extract_request_token(value) == "one_time_request"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "http://localhost:8501/",
+        "?request_token=first&request_token=second",
+        "?request_token=abc&status=failed",
+    ],
+)
+def test_bad_login_returns_rejected(value):
+    from frontend.kite_download import extract_request_token
+
+    with pytest.raises(ValueError):
+        extract_request_token(value)
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("Invalid checksum private_secret", "API secret/checksum"),
+        ("Invalid api_key test_key", "API key"),
+        ("Invalid request_token one_time_request", "expired, or already used"),
+    ],
+)
+def test_token_exchange_errors_are_actionable_and_redacted(message, expected):
+    from kiteconnect.exceptions import TokenException
+
+    from frontend.kite_download import exchange_login
+
+    client = FakeKite()
+
+    def fail(*args, **kwargs):
+        raise TokenException(message, code=403)
+
+    client.generate_session = fail
+    with pytest.raises(RuntimeError) as error:
+        exchange_login(client, "one_time_request", "private_secret")
+    text = str(error.value)
+    assert expected in text and "HTTP 403" in text
+    assert (
+        "private_secret" not in text
+        and "one_time_request" not in text
+        and "test_key" not in text
+    )
+
+
+def test_browser_callback_opens_kite_menu_and_clears_token_url():
+    app = AppTest.from_file(
+        Path(__file__).resolve().parents[1] / "frontend/app.py", default_timeout=120
+    )
+    app.query_params.update(
+        {
+            "request_token": "one_time_request",
+            "status": "success",
+            "action": "login",
+            "keep": "yes",
+        }
+    )
+    app.run()
+    assert not app.exception
+    assert app.title[0].value == "Download Kite data"
+    assert app.radio(key="kite_auth_method").value == "Kite login"
+    assert app.text_input(key="kite_request_token").value == "one_time_request"
+    assert "request_token" not in app.query_params
+    assert app.query_params["keep"] == "yes"
+
+
+def test_instruments_retry_does_not_exchange_consumed_token(monkeypatch):
+    from kiteconnect.exceptions import NetworkException
+
+    import frontend.kite_download as menu
+
+    client = FakeKite()
+    exchanges = []
+    original_exchange = client.generate_session
+
+    def exchange(*args, **kwargs):
+        exchanges.append(1)
+        return original_exchange(*args, **kwargs)
+
+    client.generate_session = exchange
+    loads = []
+
+    def load(exchange):
+        loads.append(1)
+        if len(loads) == 1:
+            raise NetworkException("network down")
+        return [INSTRUMENT]
+
+    client.instruments = load
+    monkeypatch.setattr(menu, "kite_client", lambda _: client)
+    app = AppTest.from_file(
+        Path(__file__).resolve().parents[1] / "frontend/app.py", default_timeout=120
+    )
+    app.query_params.update({"request_token": "one_time_request", "status": "success"})
+    app.run()
+    app.text_input(key="kite_api_key").set_value("test_key")
+    app.text_input(key="kite_api_secret").set_value("private_secret")
+    next(b for b in app.button if b.label == "Connect to Kite").click().run()
+    assert not app.exception and "Login succeeded" in app.error[0].value
+    next(b for b in app.button if b.label == "Connect to Kite").click().run()
+    assert not app.exception and not app.error
+    assert exchanges == [1] and loads == [1, 1]

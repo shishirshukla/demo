@@ -9,7 +9,8 @@ import plotly.express as px
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from frontend.kite_download import render_kite_download
+from frontend.kite_backtest import render_saved_kite_backtest
+from frontend.kite_download import capture_kite_callback, render_kite_download
 from trading_system.backtest import BacktestEngine
 from trading_system.backtest.metrics import metrics, period_returns
 from trading_system.backtest.walk_forward import (
@@ -90,10 +91,14 @@ def bundle(results):
     return buffer.getvalue()
 
 
+capture_kite_callback()
+
 with st.sidebar:
     st.markdown("### NIFTY / REGIME LAB")
     st.caption("Research workspace · NSE cash equities")
-    page = st.radio("Menu", ["Backtest dashboard", "Download Kite data"])
+    page = st.radio(
+        "Menu", ["Backtest dashboard", "Download Kite data"], key="workspace_menu"
+    )
     if page == "Download Kite data":
         st.caption("Zerodha Kite - historical one-minute OHLCV")
 
@@ -102,7 +107,9 @@ if page == "Download Kite data":
     st.stop()
 
 with st.sidebar:
-    source = st.radio("Data source", ["Synthetic demo", "Upload CSV files"])
+    source = st.radio(
+        "Data source", ["Synthetic demo", "Saved Kite downloads", "Upload CSV files"]
+    )
     settings_file = st.file_uploader("Optional settings YAML", type=["yaml", "yml"])
     try:
         settings = load_settings(settings_file)
@@ -142,8 +149,11 @@ with st.sidebar:
         "Maximum positions", 1, 10, int(settings["portfolio"]["max_positions"])
     )
     dataset = None
+    data_selection = {"source": source}
     if source == "Synthetic demo":
         dataset = get_demo()
+    elif source == "Saved Kite downloads":
+        dataset, data_selection = render_saved_kite_backtest(mode)
     else:
         uploads = {
             key: st.file_uploader(label, type="csv", key=key)
@@ -193,6 +203,7 @@ if run:
                 BacktestEngine(settings).run(dataset, bps, start, end, mode)
                 for bps in [3, 5, 10]
             ]
+            st.session_state["last_data_selection"] = data_selection
             st.session_state["last_dataset"] = dataset
             st.session_state["last_mode"] = mode
             st.session_state["last_range"] = (start, end)
@@ -220,6 +231,14 @@ if results[0].synthetic:
 st.caption(
     f"Showing last completed run: {st.session_state['last_mode']} · {st.session_state['last_range'][0]} to {st.session_state['last_range'][1]}. Run again to apply changed controls."
 )
+last_selection = st.session_state.get("last_data_selection", {})
+if last_selection.get("source") == "Saved Kite downloads":
+    st.caption(
+        "Last completed run used downloaded stocks: "
+        + ", ".join(last_selection["symbols"])
+        + " / benchmark "
+        + last_selection["benchmark"]
+    )
 scenario = st.selectbox("Slippage scenario", [3, 5, 10], index=1)
 r = next(x for x in results if x.slippage_bps == scenario)
 m = metrics(r)

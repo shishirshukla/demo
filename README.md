@@ -62,8 +62,13 @@ uv pip install --python .venv\Scripts\python.exe -e ".[kite-data]"
    [Kite developer console](https://developers.kite.trade/).
 2. Enter the API key and a current access token, then click **Connect to Kite**.
    Alternatively select **Kite login**, open Zerodha login, and paste the redirect
-   URL (or request token) together with your API secret. The redirect URL must
-   match the URL registered for your app. Request tokens must be exchanged promptly.
+   URL (or request token) together with your API secret. Set the registered redirect
+   URL to the dashboard address you use, for example `http://localhost:8501/`.
+   Use `http://127.0.0.1:8501/` if that is how you open the dashboard. On return,
+   the dashboard opens the Kite menu, captures the token, and removes it from
+   the browser URL. A new browser tab has a separate session; enter your API key
+   and secret again in that tab. Request tokens must be exchanged promptly.
+   The API secret comes from the Kite Connect app, not your account password.
 3. Select NSE instruments from Kite's instrument master, choose inclusive start
    and end dates, optionally name the dataset, and click **Download and save locally**.
 4. The dashboard displays the saved folder, candle preview, coverage manifest,
@@ -93,6 +98,29 @@ aggregation to complete five-minute bar-close sessions plus daily context before
 use with the existing backtester. No adjustment or aggregation is applied here.
 See [Kite historical data](https://kite.trade/docs/connect/v3/historical/) and
 [Kite authentication](https://kite.trade/docs/connect/v3/user/) for API details.
+
+### Backtest locally downloaded Kite symbols
+
+In **Backtest dashboard**, choose **Saved Kite downloads** as the data source.
+Select one or more saved dataset folders, then select **Downloaded symbols for
+backtest** and a **Benchmark index**. Download NIFTY 50 for the same dates as the
+stocks; a separate benchmark download can be combined with stock downloads in
+this selector. Edit sectors under **Selected universe / sectors** if needed.
+The selected stocks form a fixed user-defined research universe.
+
+The dashboard builds daily OHLCV and, for intraday/hybrid mode, five-minute OHLCV
+with bar-close timestamps from Kite's one-minute bar-start candles. It keeps only
+sessions with all 375 regular-market minutes from 09:15 through 15:29 and only
+dates shared by every selected stock and the benchmark. Incomplete/current sessions
+are excluded, with coverage shown in the sidebar. Missing prices are not filled.
+Overlapping identical candles are deduplicated; conflicting overlaps are rejected.
+Provider prices are used without applying corporate-action adjustments.
+
+Choose the research period and click **Run backtest**. Earlier downloaded sessions
+remain available for warmup. Most strategies need at least 200 daily sessions;
+short downloads may run with no trades. The last completed run identifies its
+selected stocks and benchmark so changed controls cannot be mistaken for the
+previous results. No Kite login or network access is needed to backtest saved files.
 
 ### Download daily history with yfinance
 
@@ -202,3 +230,18 @@ The research/backtest system and frontend are implemented, with optional yfinanc
 .\.venv\Scripts\python.exe -m ruff check trading_system frontend tests scripts
 ```
 
+
+### Troubleshooting Kite login
+
+- **Token exchange / checksum error:** use the API key and API secret from the
+  same active Kite Connect app. After correcting them, start a fresh Zerodha login.
+- **Invalid, expired, or used request token:** request tokens are short-lived and
+  single-use. Obtain a new one. You can paste a full redirect URL, its query
+  string, or just the token. Do not paste an access token into the request-token field.
+- **Login succeeded, instruments could not be loaded:** click **Connect to Kite**
+  again. The dashboard reuses the exchanged access token instead of exchanging
+  the one-time request token again.
+- **Redirect does not reach the app:** check the dashboard is running and the
+  redirect URL in the developer console matches the hostname, port, and path.
+  Login failures show the operation, error type, and HTTP status without exposing
+  credentials. Share that displayed error if you need further diagnosis.
