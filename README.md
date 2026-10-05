@@ -47,6 +47,53 @@ Add `--intraday path.csv --benchmark-intraday path.csv --mode hybrid` to use rea
 
 ## Data contracts
 
+### Download historical one-minute candles with Zerodha Kite
+
+Open **Menu > Download Kite data** in the dashboard. Install the official Python
+client in the project environment:
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -e ".[kite-data]"
+# On a pip-enabled environment:
+.\.venv\Scripts\python.exe -m pip install -e ".[kite-data]"
+```
+
+1. Create a Kite Connect app with historical market-data access in the
+   [Kite developer console](https://developers.kite.trade/).
+2. Enter the API key and a current access token, then click **Connect to Kite**.
+   Alternatively select **Kite login**, open Zerodha login, and paste the redirect
+   URL (or request token) together with your API secret. The redirect URL must
+   match the URL registered for your app. Request tokens must be exchanged promptly.
+3. Select NSE instruments from Kite's instrument master, choose inclusive start
+   and end dates, optionally name the dataset, and click **Download and save locally**.
+4. The dashboard displays the saved folder, candle preview, coverage manifest,
+   and an optional ZIP copy. **Saved local datasets** lists previous downloads.
+
+Every successful download creates a new folder under `data/private/kite/` with
+`candles_1minute.csv`, `instruments.csv`, and `download_manifest.json`. Files are
+stored on the computer running Streamlit, independently of a browser download.
+Existing datasets are preserved. The folder is ignored by git. Credentials are
+kept only in the dashboard session; **Disconnect and clear credentials** clears
+that session's connection and inputs. No credentials are stored in exported files.
+Tokens expire (normally at 6 AM the next day); reconnect with a fresh token.
+
+The downloader uses the official `kiteconnect` client and `historical_data` with
+interval `minute`, splitting long ranges into disjoint 30-calendar-day requests.
+Requests are paced below three per second; transient failures retry up to three
+attempts. Authentication and permission errors stop immediately. A failed symbol
+aborts the batch without saving a partial dataset. Files are written in a temporary
+folder and published together after success. Empty request windows are recorded
+in the manifest; entirely empty instrument results are rejected.
+
+CSV timestamps retain Kite's **bar-start** convention in **Asia/Kolkata**: 09:15
+represents the 09:15-09:16 candle. OHLC and volume come from Kite; missing minutes
+and holidays are not filled, and the current unfinished minute is excluded.
+Inspect manifest coverage for availability. These one-minute files need separate
+aggregation to complete five-minute bar-close sessions plus daily context before
+use with the existing backtester. No adjustment or aggregation is applied here.
+See [Kite historical data](https://kite.trade/docs/connect/v3/historical/) and
+[Kite authentication](https://kite.trade/docs/connect/v3/user/) for API details.
+
 ### Download daily history with yfinance
 
 The optional downloader fetches daily stock OHLCV plus NIFTY 50 (`^NSEI`) and produces CSVs directly usable by this application's CLI or upload dashboard.
@@ -146,7 +193,7 @@ Each report includes 3/5/10 bps comparison, equity/drawdown, daily turnover, mon
 
 ## Current scope
 
-The research/backtest system and frontend are implemented, with an optional yfinance daily-data downloader. Live brokerage, streaming market data, durable paper-trading state/recovery, effective-dated tariffs, optional spread/turnover filters, correlation rejection, and Monte Carlo trade-sequence analysis remain future modules. `PaperBroker` is an order recorder for adapter development. `LiveBroker` deliberately raises until a validated adapter exists. This project does not publish the repository remotely.
+The research/backtest system and frontend are implemented, with optional yfinance daily-data and Zerodha Kite historical one-minute OHLCV downloaders. Kite downloads save complete datasets to local storage. Live brokerage, streaming market data, durable paper-trading state/recovery, effective-dated tariffs, optional spread/turnover filters, correlation rejection, and Monte Carlo trade-sequence analysis remain future modules. `PaperBroker` is an order recorder for adapter development. `LiveBroker` deliberately raises until a validated adapter exists. This project does not publish the repository remotely.
 
 ## Checks
 

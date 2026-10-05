@@ -9,6 +9,7 @@ import plotly.express as px
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from frontend.kite_download import render_kite_download
 from trading_system.backtest import BacktestEngine
 from trading_system.backtest.metrics import metrics, period_returns
 from trading_system.backtest.walk_forward import (
@@ -92,6 +93,15 @@ def bundle(results):
 with st.sidebar:
     st.markdown("### NIFTY / REGIME LAB")
     st.caption("Research workspace · NSE cash equities")
+    page = st.radio("Menu", ["Backtest dashboard", "Download Kite data"])
+    if page == "Download Kite data":
+        st.caption("Zerodha Kite - historical one-minute OHLCV")
+
+if page == "Download Kite data":
+    render_kite_download()
+    st.stop()
+
+with st.sidebar:
     source = st.radio("Data source", ["Synthetic demo", "Upload CSV files"])
     settings_file = st.file_uploader("Optional settings YAML", type=["yaml", "yml"])
     try:
