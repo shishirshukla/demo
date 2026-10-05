@@ -47,6 +47,31 @@ Add `--intraday path.csv --benchmark-intraday path.csv --mode hybrid` to use rea
 
 ## Data contracts
 
+### Download daily history with yfinance
+
+The optional downloader fetches daily stock OHLCV plus NIFTY 50 (`^NSEI`) and produces CSVs directly usable by this application's CLI or upload dashboard.
+
+In the existing uv-created environment, install with `uv pip install --python .venv\Scripts\python.exe -e ".[market-data]"`; the optional dependency is already installed in this workspace. On a standard pip-enabled environment use the command below.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[market-data]"
+
+# Download a sample of real NSE tickers; replace this CSV with your full universe.
+.\.venv\Scripts\python.exe scripts/download_historical.py --universe config/universe_nse_example.csv --start 2012-01-01 --output data/private/yfinance
+
+# Or provide individual symbols. Plain tickers receive the .NS suffix.
+.\.venv\Scripts\python.exe scripts/download_historical.py --symbols RELIANCE TCS INFY --start 2020-01-01 --end 2025-01-01 --output data/private/custom
+
+# Test the downloaded data; this includes warmup history from the CSV.
+.\.venv\Scripts\python.exe -m trading_system.main --daily data/private/yfinance/daily.csv --benchmark data/private/yfinance/benchmark.csv --universe data/private/yfinance/universe.csv --start 2023-01-01 --output output/yfinance
+```
+
+The same downloader is available as `python -m trading_system.data.yfinance_downloader` or the installed `nifty-download` command. `--start` is inclusive; `--end` is exclusive and defaults to today's date in Asia/Kolkata, excluding today's unfinished daily bar. The script writes `daily.csv`, `benchmark.csv`, `universe.csv`, and `download_manifest.json`. Downloaded files default to the ignored `data/private/` folder. Use `--overwrite` to replace an existing dataset. CLI symbol lists get `Unknown` sector metadata; edit the exported universe to set sectors before applying sector risk limits. The example NSE universe lists only five sample stocks and makes no claim about historical index membership. The original `config/universe.csv` remains the fictional demo universe and is rejected by the downloader.
+
+Universe input may include `yahoo_symbol` overrides while retaining your internal `symbol`, sector and membership dates. Repeated historical membership intervals download the ticker once and remain in the exported universe. Dates are never inferred from the current index. Downloads are sequential with configurable `--retries`, `--delay`, and `--timeout`. By default a failed stock or benchmark aborts without saving a dataset. `--allow-partial` explicitly permits failed stocks to be excluded, recording their errors and the resulting coverage in the manifest; benchmark failure remains fatal. An incomplete universe changes breadth and relative-strength ranks, so inspect the manifest before comparing runs.
+
+The adapter requests raw OHLC and adjusted close, then applies `Adj Close / Close` to **all** OHLC columns. Exported `adjusted_close` equals `close`, satisfying the engine's consistent-price-basis requirement. Volume remains Yahoo's reported volume; turnover is raw reported close × reported volume, an approximation rather than official NSE traded value. Empty, partly missing, non-finite, duplicate or invalid bars are rejected; entirely blank provider rows are removed. Yahoo can revise corporate-action adjustments and historical data. Save the manifest and CSVs with each research run. See the official [yfinance download API](https://ranaroussi.github.io/yfinance/reference/api/yfinance.download.html) for date and adjustment semantics and the [project's usage notice](https://github.com/ranaroussi/yfinance) for Yahoo data terms. This script downloads daily history; it does not produce the complete five-minute sessions required by the intraday engine.
+
 Daily and five-minute CSVs contain `timestamp,symbol,open,high,low,close,volume`. Optional daily fields include `adjusted_close` and `turnover`. Prices and volume must use a consistent corporate-action-adjusted basis. If `adjusted_close` differs from `close`, ingestion rejects the mixed basis rather than silently combining incompatible prices. If adjustment flags are present, clear them after upstream adjustment. Missing adjusted_close means the caller asserts the supplied OHLC is already suitable for research.
 
 Naive timestamps are interpreted in **Asia/Kolkata**. Daily timestamps normalize to 15:30 IST. Five-minute timestamps denote **bar close**: 09:20 is the 09:15–09:20 bar. The opening range includes closes through 09:30 (three bars), and breakout signals begin at 09:35. Intraday mode requires every supplied symbol/session to contain all 75 close timestamps from 09:20 through 15:30. Missing bars are rejected; the system does not invent a 15:10 exit price. Inputs must not include auction or out-of-session bars. Users supply an exchange-calendar-cleaned historical dataset; business days in the demo do not model NSE holidays.
@@ -121,7 +146,7 @@ Each report includes 3/5/10 bps comparison, equity/drawdown, daily turnover, mon
 
 ## Current scope
 
-The research/backtest system and frontend are implemented. Live brokerage, streaming market data, durable paper-trading state/recovery, effective-dated tariffs, optional spread/turnover filters, correlation rejection, and Monte Carlo trade-sequence analysis remain future modules. `PaperBroker` is an order recorder for adapter development. `LiveBroker` deliberately raises until a validated adapter exists. This project does not automatically download proprietary market data or publish the repository remotely.
+The research/backtest system and frontend are implemented, with an optional yfinance daily-data downloader. Live brokerage, streaming market data, durable paper-trading state/recovery, effective-dated tariffs, optional spread/turnover filters, correlation rejection, and Monte Carlo trade-sequence analysis remain future modules. `PaperBroker` is an order recorder for adapter development. `LiveBroker` deliberately raises until a validated adapter exists. This project does not publish the repository remotely.
 
 ## Checks
 

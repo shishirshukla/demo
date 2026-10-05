@@ -1,0 +1,6 @@
+symbol,sector,index_group,lot_size,is_fno,active_from,active_to
+RELIANCE,Energy,EXAMPLE,1,false,,
+TCS,Technology,EXAMPLE,1,false,,
+INFY,Technology,EXAMPLE,1,false,,
+HDFCBANK,Finance,EXAMPLE,1,false,,
+ITC,Consumer,EXAMPLE,1,false,,
