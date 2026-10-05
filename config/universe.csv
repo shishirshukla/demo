@@ -1,0 +1,10 @@
+symbol,sector,index_group,lot_size,is_fno,active_from,active_to
+DEMO01,Technology,SYNTHETIC,1,false,2020-01-01,
+DEMO02,Finance,SYNTHETIC,1,false,2020-01-01,
+DEMO03,Energy,SYNTHETIC,1,false,2020-01-01,
+DEMO04,Consumer,SYNTHETIC,1,false,2020-01-01,
+DEMO05,Technology,SYNTHETIC,1,false,2020-01-01,
+DEMO06,Finance,SYNTHETIC,1,false,2020-01-01,
+DEMO07,Energy,SYNTHETIC,1,false,2020-01-01,
+DEMO08,Consumer,SYNTHETIC,1,false,2020-01-01,
+

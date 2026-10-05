@@ -1,0 +1,14 @@
+{
+  "data_sha256": {
+    "daily": "43e25c737de6eebb727e4f6efc31d103f9d1f7f584455386347396580ae49e16",
+    "benchmark": "b8d2b5dd6f971b2001e2264a4ee7f67f81f09a17998c655bab600e0fd7da27fd",
+    "universe": "8c8b33f58bd6d832aff6cef1dc087786e8617b04576d997397c4e7289b837146",
+    "intraday": "63fef5171a52dd511253d06207efdb6ed07c3863c457ce5006f999fd9b97e2c7",
+    "benchmark_intraday": "91062bb751559ee8c4b37af78d35bc72f6e16dcfa56af3d7ebba9377a739051c"
+  },
+  "python": "3.14.4",
+  "pandas": "3.0.6",
+  "synthetic": true,
+  "price_basis": "consistently adjusted OHLC",
+  "cost_rates": "constant configurable research assumptions"
+}

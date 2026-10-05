@@ -1,0 +1,82 @@
+portfolio:
+  initial_capital: 150000
+  risk_per_trade: 0.005
+  daily_loss_limit: 0.015
+  weekly_loss_limit: 0.04
+  max_positions: 3
+  max_stock_allocation: 0.30
+  max_sector_positions: 2
+  max_gross_exposure: 1.0
+liquidity:
+  min_price: 50
+  min_turnover: 200000000
+  min_volume: 0
+regime:
+  breadth_bull: 0.55
+  breadth_bear: 0.45
+  adx_directional: 20
+  ema_fast: 50
+  ema_slow: 200
+  slope_sessions: 5
+costs:
+  # Editable research assumptions; not an effective-dated historical tariff.
+  brokerage_rate: 0.0003
+  brokerage_cap: 20
+  delivery_brokerage_rate: 0
+  exchange_rate: 0.0000297
+  sebi_rate: 0.000001
+  gst_rate: 0.18
+  delivery_stt: 0.001
+  intraday_sell_stt: 0.00025
+  delivery_stamp: 0.00015
+  intraday_stamp: 0.00003
+  spread_bps: 2
+  slippage_scenarios: [3, 5, 10]
+strategies:
+  momentum_pullback:
+    enabled: true
+    rs20_percentile: 0.80
+    rs60_percentile: 0.70
+    pullback_min: 0.02
+    pullback_max: 0.05
+    atr_stop: 2.0
+    atr_trail: 2.5
+    max_holding_days: 10
+  volatility_breakout:
+    enabled: true
+    volatility_percentile: 0.30
+    atr_percentile: 0.40
+    breakout_lookback: 20
+    volume_multiplier: 1.5
+    entry_buffer_atr: 0.1
+    stop_atr: 1.5
+    trail_atr: 2.5
+    max_holding_days: 7
+  weakness_breakdown:
+    enabled: true
+    rs_percentile: 0.20
+    support_lookback: 10
+    relative_volume: 1.5
+    stop_atr: 1.5
+    max_r_target: 2.5
+    force_exit: '15:10'
+  vwap_reversion:
+    enabled: true
+    adx_max: 20
+    breadth_min: 0.45
+    breadth_max: 0.55
+    deviation_std: 2
+    rsi_long: 25
+    rsi_short: 75
+    residual_min: 0.005
+    stop_buffer_atr: 0.25
+    force_exit: '15:10'
+  opening_momentum:
+    enabled: true
+    opening_range_minutes: 15
+    relative_volume: 1.5
+    bull_breadth: 0.60
+    bear_breadth: 0.40
+    target_r: 2.0
+    force_exit: '15:10'
+
