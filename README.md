@@ -77,16 +77,35 @@ uv pip install --python .venv\Scripts\python.exe -e ".[kite-data]"
 Every successful download creates a new folder under `data/private/kite/` with
 `candles_1minute.csv`, `instruments.csv`, and `download_manifest.json`. Files are
 stored on the computer running Streamlit, independently of a browser download.
-Existing datasets are preserved. The folder is ignored by git. Credentials are
-kept only in the dashboard session; **Disconnect and clear credentials** clears
-that session's connection and inputs. No credentials are stored in exported files.
-Tokens expire (normally at 6 AM the next day); reconnect with a fresh token.
+Existing datasets are preserved. The folder is ignored by git.
+
+After account verification, the API key and access token are saved to
+`data/private/kite_credentials.json` on the computer running Streamlit. Opening
+the Kite menu restores and verifies this connection, including after browser or
+app restarts. The file is the credential source; authenticated clients and tokens
+are not retained in dashboard session state. Password inputs are cleared after
+saving. API secrets and one-time request tokens are never written to this file,
+and credentials are excluded from dataset/report exports and ZIP downloads.
+Tokens still expire (normally at 6 AM the next day); reconnect with a fresh token.
+If loading instruments fails after login, **Retry saved connection** reuses the
+saved access token without exchanging the consumed request token again.
+
+The credential file is unencrypted JSON in the git-ignored `data/private/`
+directory. It is written atomically with owner-only file permissions (`0600`) on
+POSIX systems; on Windows, access is governed by the directory's ACLs. There is
+one saved Kite connection per application installation, shared by its browser
+sessions. **Disconnect and clear credentials** deletes this file and clears the
+current session's connection data and inputs; other sessions notice the deletion
+on their next rerun. Downloaded datasets are preserved.
 
 The downloader uses the official `kiteconnect` client and `historical_data` with
 interval `minute`, splitting long ranges into disjoint 30-calendar-day requests.
-Requests are paced below three per second; transient failures retry up to three
-attempts. Authentication and permission errors stop immediately. A failed symbol
-aborts the batch without saving a partial dataset. Files are written in a temporary
+Requests wait at least one second before each historical API call; transient
+failures retry up to three attempts with two- and four-second pauses. HTTP 429
+rate-limit errors use longer ten- and twenty-second cooldowns. Retries always
+respect a longer configured request delay. Authentication and permission errors
+stop immediately. A failed symbol aborts the batch without saving a partial
+dataset. Files are written in a temporary
 folder and published together after success. Empty request windows are recorded
 in the manifest; entirely empty instrument results are rejected.
 
@@ -98,6 +117,46 @@ aggregation to complete five-minute bar-close sessions plus daily context before
 use with the existing backtester. No adjustment or aggregation is applied here.
 See [Kite historical data](https://kite.trade/docs/connect/v3/historical/) and
 [Kite authentication](https://kite.trade/docs/connect/v3/user/) for API details.
+
+### Download the NIFTY 100 stock list from the command line
+
+`scripts/download_kite_minutes.py` downloads historical one-minute OHLCV using
+the same Kite downloader and saved credentials as the dashboard. Connect in the
+dashboard once to save a current access token, then run from the project root:
+
+```bash
+.venv/bin/python scripts/download_kite_minutes.py --start 2026-09-01 --end 2026-10-05
+# Include NIFTY 50 so the downloaded dataset also has a backtest benchmark.
+.venv/bin/python scripts/download_kite_minutes.py --start 2026-09-01 --end 2026-10-05 --include-benchmark
+# Slow requests further if needed: wait at least two seconds between API calls.
+.venv/bin/python scripts/download_kite_minutes.py --start 2026-09-01 --end 2026-10-05 --delay 2
+```
+
+On Windows, use `.\.venv\Scripts\python.exe` in place of `.venv/bin/python`.
+Both dates are inclusive; `--start` is required and `--end` defaults to yesterday
+in Asia/Kolkata. Supplying today's date explicitly excludes the unfinished live
+minute. By default, the script finds the single `MW-NIFTY-100*.csv` in the project
+root (currently `MW-NIFTY-100-05-Oct-2026.csv`), reads its `SYMBOL` column, skips the
+`NIFTY 100` summary row, and removes repeated symbols. Use `--stocks-file PATH`
+to select a different snapshot or disambiguate multiple matching files. Snapshot
+stocks form a fixed user-supplied list, not a historical index-membership universe.
+
+`--delay SECONDS` sets the minimum pause before every historical request,
+including between stocks and date batches. It defaults to one second and must
+be finite and at least 0.4 seconds. Rate-limit responses trigger ten- and
+twenty-second retry cooldowns, or the configured delay if longer. The selected
+delay is recorded in the download manifest.
+
+The script resolves exact NSE equity symbols against Kite's instrument list and
+stops if any cannot be found. It batches requests, retries transient failures, and
+excludes unfinished minutes through the shared downloader. A failed stock aborts
+the run without saving a partial dataset. Successful runs create a new folder
+under `data/private/kite/` with `candles_1minute.csv`, `instruments.csv`, and
+`download_manifest.json`, visible in the dashboard's saved-dataset selector.
+`--output DIR` changes the parent directory; `--label NAME` sets a folder label.
+Use `--credentials-file PATH` to select another credential file with `api_key`
+and `access_token` fields. Tokens are never printed or included in exports.
+The CLI is also available as `python -m trading_system.data.kite_stock_downloader`.
 
 ### Backtest locally downloaded Kite symbols
 

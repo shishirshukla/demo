@@ -16,6 +16,8 @@ import pandas as pd
 
 TZ = "Asia/Kolkata"
 STORAGE_ROOT = Path(__file__).resolve().parents[2] / "data" / "private" / "kite"
+DEFAULT_REQUEST_DELAY = 1.0
+MIN_REQUEST_DELAY = 0.4
 
 
 def kite_client(api_key):
@@ -39,6 +41,10 @@ def api_error(exc):
         return "Kite denied access. Check your app's historical market-data access."
     if kind == "InputException":
         return "Kite rejected the request. Check the instrument and date range."
+    if getattr(exc, "code", None) == 429:
+        return (
+            "Kite rate limit reached. Increase the request delay and try again later."
+        )
     if kind in {"Timeout", "ReadTimeout", "ConnectionError", "NetworkException"}:
         return "Could not reach Kite. Check your connection and try again."
     return "Kite request failed. Check credentials, market-data access, and connection."
@@ -129,9 +135,30 @@ class KiteDownload:
         return buffer.getvalue()
 
 
+def validate_request_delay(value):
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        delay = float("nan")
+    if not np.isfinite(delay) or delay < MIN_REQUEST_DELAY:
+        raise ValueError(
+            f"Request delay must be finite and at least {MIN_REQUEST_DELAY:g} seconds."
+        )
+    return delay
+
+
 def download_kite_minutes(
-    client, instruments, start, end, *, now=None, progress=None, sleep=time.sleep
+    client,
+    instruments,
+    start,
+    end,
+    *,
+    now=None,
+    progress=None,
+    request_delay=DEFAULT_REQUEST_DELAY,
+    sleep=time.sleep,
 ):
+    request_delay = validate_request_delay(request_delay)
     if instruments.empty or not {
         "tradingsymbol",
         "exchange",
@@ -148,8 +175,9 @@ def download_kite_minutes(
     for instrument in instruments.to_dict("records"):
         chunks, empty_windows = [], 0
         for first, stop in windows:
+            wait = request_delay
             for attempt in range(3):
-                sleep(0.4 if attempt == 0 else 2**attempt)
+                sleep(wait)
                 try:
                     records = client.historical_data(
                         int(instrument["instrument_token"]),
@@ -163,17 +191,27 @@ def download_kite_minutes(
                     )
                     break
                 except Exception as exc:
-                    retryable = type(exc).__name__ in {
+                    kind, code = type(exc).__name__, getattr(exc, "code", None)
+                    retryable = kind in {
                         "NetworkException",
                         "Timeout",
                         "ReadTimeout",
                         "ConnectionError",
                         "DataException",
-                    } or getattr(exc, "code", None) in {429, 500, 502, 503, 504}
+                    } or code in {429, 500, 502, 503, 504}
+                    if kind in {
+                        "TokenException",
+                        "PermissionException",
+                        "InputException",
+                    }:
+                        retryable = False
                     if not retryable or attempt == 2:
                         raise RuntimeError(
                             f"{instrument['tradingsymbol']}: {api_error(exc)} No dataset saved."
                         ) from None
+                    # Give rate limiting a longer cooldown, while respecting
+                    # the configured minimum pause on every retry.
+                    wait = max(request_delay, (10 if code == 429 else 2) * 2**attempt)
             chunk = normalize_candles(records, instrument, first, stop)
             if chunk.empty:
                 empty_windows += 1
@@ -213,6 +251,7 @@ def download_kite_minutes(
         {
             "provider": "Zerodha Kite Connect",
             "interval": "minute",
+            "request_delay_seconds": request_delay,
             "timezone": TZ,
             "timestamp_convention": "bar start (Kite native)",
             "requested_start": str(local_time(start).date()),

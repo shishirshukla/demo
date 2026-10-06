@@ -8,6 +8,11 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import pandas as pd
 import streamlit as st
 
+from trading_system.data.kite_credentials import (
+    clear_kite_credentials,
+    load_kite_credentials,
+    save_kite_credentials,
+)
 from trading_system.data.kite_downloader import (
     STORAGE_ROOT,
     api_error,
@@ -89,22 +94,105 @@ def exchange_login(client, request, secret):
     return client
 
 
+def clear_kite_connection():
+    for key in (
+        "kite_client",
+        "kite_pending_client",
+        "kite_pending_signature",
+        "kite_credential_fingerprint",
+        "kite_instruments",
+        "kite_download",
+        "kite_user",
+    ):
+        st.session_state.pop(key, None)
+
+
+def disconnect_kite():
+    """Delete the saved token before clearing widgets in the button callback."""
+    try:
+        clear_kite_credentials()
+    except OSError:
+        st.session_state["kite_credentials_error"] = (
+            "Could not delete the saved credentials. Check folder permissions and retry."
+        )
+        return
+    for key in list(st.session_state):
+        if key.startswith("kite_"):
+            del st.session_state[key]
+
+
+def restore_kite_connection():
+    """Build a transient client from disk; keep only non-secret UI data in session."""
+    # Remove clients retained by older versions of the dashboard.
+    for key in ("kite_client", "kite_pending_client", "kite_pending_signature"):
+        st.session_state.pop(key, None)
+    try:
+        credentials = load_kite_credentials()
+    except ValueError as exc:
+        clear_kite_connection()
+        st.error(str(exc))
+        return None, True
+    except OSError:
+        clear_kite_connection()
+        st.error("Could not read saved Kite credentials. Check folder permissions.")
+        return None, True
+    if credentials is None:
+        clear_kite_connection()
+        return None, False
+    fingerprint = hashlib.sha256(
+        (credentials.api_key + "\0" + credentials.access_token).encode()
+    ).hexdigest()
+    if st.session_state.get("kite_credential_fingerprint") != fingerprint:
+        clear_kite_connection()
+    try:
+        client = kite_client(credentials.api_key)
+        client.set_access_token(credentials.access_token)
+        profile = client.profile()
+    except Exception as exc:
+        clear_kite_connection()
+        st.error("Saved Kite credentials could not be verified. " + api_error(exc))
+        return None, True
+    try:
+        if "kite_instruments" not in st.session_state:
+            st.session_state["kite_instruments"] = nse_instruments(client)
+    except (ValueError, RuntimeError) as exc:
+        st.error(
+            "Login succeeded, but NSE instruments could not be loaded. "
+            "Click Retry saved connection without logging in again. " + str(exc)
+        )
+        return None, True
+    st.session_state["kite_credential_fingerprint"] = fingerprint
+    st.session_state["kite_user"] = profile.get("user_id", "Kite user")
+    return client, True
+
+
 def render_kite_download():
+    if st.session_state.pop("kite_clear_auth_inputs", False):
+        for key in (
+            "kite_api_key",
+            "kite_access_token",
+            "kite_api_secret",
+            "kite_request_token",
+        ):
+            st.session_state.pop(key, None)
     st.title("Download Kite data")
     st.caption("Zerodha Kite Connect · historical one-minute OHLCV · local CSV storage")
     st.markdown(
         "Use a Kite Connect app with historical market-data access. [Kite developer console](https://developers.kite.trade/) · [Historical API documentation](https://kite.trade/docs/connect/v3/historical/)"
     )
+    client, saved_credentials = restore_kite_connection()
+    if st.session_state.get("kite_credentials_error"):
+        st.error(st.session_state.pop("kite_credentials_error"))
     if st.session_state.get("kite_callback_error"):
         st.error(st.session_state["kite_callback_error"])
-    if (
-        st.session_state.get("kite_callback_received")
-        and "kite_client" not in st.session_state
-    ):
+    if st.session_state.get("kite_callback_received") and client is None:
         st.info(
             "Zerodha returned a login token. Enter your API key and secret in this tab, then click Connect to Kite promptly. A new tab has a separate dashboard session."
         )
-    with st.expander("Connect to Kite", expanded="kite_client" not in st.session_state):
+    with st.expander("Connect to Kite", expanded=client is None):
+        if saved_credentials and client is None:
+            if st.button("Retry saved connection"):
+                st.rerun()
         api_key = st.text_input("Kite API key", type="password", key="kite_api_key")
         method = st.radio(
             "Authentication", ["Access token", "Kite login"], key="kite_auth_method"
@@ -139,16 +227,11 @@ def render_kite_download():
             )
             token = ""
         st.caption(
-            "Credentials stay in this dashboard session and are not saved to disk. Kite access tokens expire; reconnect when required."
+            "The API key and access token are saved locally and reused after a restart. "
+            "API secrets and request tokens are used only for login. "
+            "Kite access tokens expire; reconnect when required."
         )
         if st.button("Connect to Kite", type="primary"):
-            for key in (
-                "kite_client",
-                "kite_instruments",
-                "kite_download",
-                "kite_user",
-            ):
-                st.session_state.pop(key, None)
             try:
                 if method == "Access token" and not token.strip():
                     raise ValueError("Enter an access token")
@@ -161,53 +244,38 @@ def render_kite_download():
                     if method == "Kite login"
                     else token.strip()
                 )
-                signature = hashlib.sha256(
-                    (method + "\0" + api_key.strip() + "\0" + request).encode()
-                ).hexdigest()
-                # Reuse an exchanged token when account/instrument loading failed.
-                client = (
-                    st.session_state.get("kite_pending_client")
-                    if st.session_state.get("kite_pending_signature") == signature
-                    else None
-                )
-                with st.spinner("Connecting and loading NSE instruments..."):
-                    if client is None:
-                        client = kite_client(api_key)
-                        if method == "Kite login":
-                            exchange_login(client, request, secret)
-                        else:
-                            client.set_access_token(request)
-                        st.session_state["kite_pending_client"] = client
-                        st.session_state["kite_pending_signature"] = signature
+                with st.spinner("Connecting and saving credentials..."):
+                    new_client = kite_client(api_key)
+                    if method == "Kite login":
+                        exchange_login(new_client, request, secret)
+                    else:
+                        new_client.set_access_token(request)
                     try:
-                        profile = client.profile()
+                        new_client.profile()
                     except Exception as exc:
                         raise RuntimeError(
                             "Kite account verification failed. " + api_error(exc)
                         ) from None
-                    try:
-                        instruments = nse_instruments(client)
-                    except (ValueError, RuntimeError) as exc:
-                        raise RuntimeError(
-                            "Login succeeded, but NSE instruments could not be loaded. Click Connect to Kite to retry without logging in again. "
-                            + str(exc)
-                        ) from None
-                st.session_state["kite_client"] = client
+                    # Save before loading instruments so a consumed request token
+                    # never needs another exchange after an instrument-load failure.
+                    save_kite_credentials(api_key, new_client.access_token)
+                clear_kite_connection()
                 st.session_state.pop("kite_callback_received", None)
-                st.session_state["kite_user"] = profile.get("user_id", "Kite user")
-                st.session_state["kite_instruments"] = instruments
+                st.session_state["kite_clear_auth_inputs"] = True
                 st.rerun()
             except (ValueError, RuntimeError) as exc:
                 st.error(str(exc))
+            except OSError:
+                st.error(
+                    "Could not save Kite credentials. Check disk space and folder "
+                    "permissions. If you used Kite login, start a fresh login to retry."
+                )
             except Exception as exc:
                 st.error(api_error(exc))
-    if "kite_client" in st.session_state:
+    if saved_credentials:
+        st.button("Disconnect and clear credentials", on_click=disconnect_kite)
+    if client is not None:
         st.success(f"Connected as {st.session_state['kite_user']}")
-        if st.button("Disconnect and clear credentials"):
-            for key in list(st.session_state):
-                if key.startswith("kite_"):
-                    del st.session_state[key]
-            st.rerun()
         instruments = st.session_state["kite_instruments"]
         tokens = instruments.instrument_token.astype(int).tolist()
         labels = {
@@ -253,7 +321,7 @@ def render_kite_download():
                     )
                 status = st.progress(0, text="Preparing download...")
                 result = download_kite_minutes(
-                    st.session_state["kite_client"],
+                    client,
                     instruments.loc[instruments.instrument_token.isin(selected)],
                     start,
                     end,
