@@ -99,19 +99,39 @@ current session's connection data and inputs; other sessions notice the deletion
 on their next rerun. Downloaded datasets are preserved.
 
 The downloader uses the official `kiteconnect` client and `historical_data` with
-interval `minute`, splitting long ranges into disjoint 30-calendar-day requests.
+interval `minute`. It splits the selected range into **non-overlapping batches of
+up to 60 calendar days per instrument**, collects all responses, and then
+processes the downloaded candles. The final batch can be shorter. This respects
+Kite's maximum of
+[60 days per one-minute request](https://kite.trade/forum/discussion/13045/getting-random-non-reproducible-35-day-limit-error);
+for example, 2022-09-01 through 2026-10-03 uses 25 requests per instrument.
+Batch boundaries preserve the full inclusive date range without overlapping
+candles. The manifest records `request_window_days` and empty request windows
+per symbol. The separate
+[historical API rate limit](https://kite.trade/docs/connect/v3/exceptions/#api-rate-limit)
+is three requests per second.
 Requests wait at least one second before each historical API call; transient
 failures retry up to three attempts with two- and four-second pauses. HTTP 429
 rate-limit errors use longer ten- and twenty-second cooldowns. Retries always
 respect a longer configured request delay. Authentication and permission errors
-stop immediately. A failed symbol aborts the batch without saving a partial
-dataset. Files are written in a temporary
-folder and published together after success. Empty request windows are recorded
-in the manifest; entirely empty instrument results are rejected.
+stop immediately. API failures abort the download without saving a partial
+dataset. Files are written in a temporary folder and published together after
+processing succeeds. Instruments with no valid completed candles are rejected.
+
+**Inconsistent candles are skipped** while valid candles are retained. Prices
+must be finite and positive, volume finite and non-negative,
+high/low must contain open and close, and timestamps must align to whole minutes.
+The manifest records `skipped_candle_count`, a per-symbol count in `coverage`, and
+every skipped candle in `skipped_candles`, with its symbol, instrument token,
+timestamp, OHLCV, and failed checks. Unparseable timestamps and non-finite values
+are recorded as JSON `null`. Missing required response columns and conflicting
+duplicate timestamps still stop the download. The dashboard and CLI show the
+skipped count; the manifest is also included in ZIP exports.
 
 CSV timestamps retain Kite's **bar-start** convention in **Asia/Kolkata**: 09:15
-represents the 09:15-09:16 candle. OHLC and volume come from Kite; missing minutes
-and holidays are not filled, and the current unfinished minute is excluded.
+represents the 09:15-09:16 candle. Retained OHLCV values come from Kite without
+alteration. Skipped candles leave gaps; missing minutes and holidays are not
+filled, and the current unfinished minute is excluded.
 Inspect manifest coverage for availability. These one-minute files need separate
 aggregation to complete five-minute bar-close sessions plus daily context before
 use with the existing backtester. No adjustment or aggregation is applied here.
@@ -142,15 +162,16 @@ to select a different snapshot or disambiguate multiple matching files. Snapshot
 stocks form a fixed user-supplied list, not a historical index-membership universe.
 
 `--delay SECONDS` sets the minimum pause before every historical request,
-including between stocks and date batches. It defaults to one second and must
+including between stocks, date batches, and retries. It defaults to one second and must
 be finite and at least 0.4 seconds. Rate-limit responses trigger ten- and
 twenty-second retry cooldowns, or the configured delay if longer. The selected
 delay is recorded in the download manifest.
 
 The script resolves exact NSE equity symbols against Kite's instrument list and
-stops if any cannot be found. It batches requests, retries transient failures, and
-excludes unfinished minutes through the shared downloader. A failed stock aborts
-the run without saving a partial dataset. Successful runs create a new folder
+stops if any cannot be found. It requests up to 60 calendar days per stock at a time, retries
+transient failures, then processes all responses and skips inconsistent candles
+through the shared downloader. API failures abort the run without saving a partial
+dataset. Successful runs create a new folder
 under `data/private/kite/` with `candles_1minute.csv`, `instruments.csv`, and
 `download_manifest.json`, visible in the dashboard's saved-dataset selector.
 `--output DIR` changes the parent directory; `--label NAME` sets a folder label.

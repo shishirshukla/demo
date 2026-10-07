@@ -13,6 +13,7 @@ from trading_system.data.kite_downloader import (
     date_windows,
     download_kite_minutes,
     normalize_candles,
+    request_bounds,
     save_kite_download,
 )
 
@@ -77,31 +78,49 @@ def instruments():
     return pd.DataFrame([INSTRUMENT])
 
 
-def test_batch_ranges_are_disjoint_and_keep_kite_timestamps():
+def test_long_range_uses_disjoint_60_day_batches_and_keeps_kite_timestamps():
     client = FakeKite()
     result = download_kite_minutes(
         client,
         instruments(),
-        "2026-07-01",
-        "2026-09-30",
+        "2022-09-01",
+        "2026-10-03",
         now="2026-10-05 10:00",
         sleep=lambda _: None,
     )
-    assert len(client.calls) == 4
+    assert len(client.calls) == 25
     assert all(
         c[3] == "minute" and c[4] == {"continuous": False, "oi": False}
         for c in client.calls
     )
+    assert client.calls[0][1] == datetime(2022, 9, 1)
+    assert client.calls[-1][2] == datetime(2026, 10, 3, 23, 59, 59)
+    for call in client.calls:
+        assert call[2] + pd.Timedelta(seconds=1) - call[1] <= pd.Timedelta(days=60)
     for previous, following in zip(client.calls, client.calls[1:]):
         assert previous[2] + pd.Timedelta(seconds=1) == following[1]
-    assert client.calls[-1][2] == datetime(2026, 9, 30, 23, 59, 59)
     assert result.candles.timestamp.dt.strftime("%H:%M").unique().tolist() == ["09:15"]
-    assert result.candles.volume.tolist() == [123] * 4
+    assert result.candles.volume.tolist() == [123] * 25
     assert len(result.manifest["coverage"]) == 1
+    assert result.manifest["request_window_days"] == 60
+    assert result.manifest["effective_end_exclusive"] == "2026-10-04T00:00:00+05:30"
+
+
+@pytest.mark.parametrize("days,count", [(1, 1), (60, 1), (61, 2), (120, 2), (121, 3)])
+def test_date_batches_cover_inclusive_range_exactly(days, count):
+    first = pd.Timestamp("2024-01-01", tz="Asia/Kolkata")
+    stop = first + pd.Timedelta(days=days)
+    windows = date_windows(first, stop - pd.Timedelta(days=1), now="2026-10-05")
+    assert len(windows) == count
+    assert windows[0][0] == first and windows[-1][1] == stop
+    assert all(end - start <= pd.Timedelta(days=60) for start, end in windows)
+    assert all(
+        previous[1] == following[0] for previous, following in zip(windows, windows[1:])
+    )
 
 
 def test_today_excludes_live_candle_and_preserves_gaps():
-    first, stop = date_windows("2026-10-05", "2026-10-05", now="2026-10-05 09:18:45")[0]
+    first, stop = request_bounds("2026-10-05", "2026-10-05", now="2026-10-05 09:18:45")
     frame = normalize_candles(
         [candle(), candle("2026-10-05 09:17"), candle("2026-10-05 09:18")],
         INSTRUMENT,
@@ -110,6 +129,9 @@ def test_today_excludes_live_candle_and_preserves_gaps():
     )
     assert frame.timestamp.dt.strftime("%H:%M").tolist() == ["09:15", "09:17"]
     assert stop.hour == 9 and stop.minute == 18
+    assert date_windows("2026-10-05", "2026-10-05", now="2026-10-05 09:18:45") == [
+        (first, stop)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -117,20 +139,174 @@ def test_today_excludes_live_candle_and_preserves_gaps():
 )
 def test_invalid_dates(start, end):
     with pytest.raises(ValueError):
-        date_windows(start, end, now="2026-10-05 12:00")
+        request_bounds(start, end, now="2026-10-05 12:00")
 
 
 @pytest.mark.parametrize(
-    "change", [{"volume": -1}, {"high": 99}, {"close": float("nan")}, {"date": "bad"}]
+    "change,reason",
+    [
+        ({"volume": -1}, "negative volume"),
+        ({"high": 99}, "high below open/close/low"),
+        ({"low": 103}, "low above open/close/high"),
+        ({"open": 0}, "non-positive OHLC price"),
+        ({"close": float("nan")}, "non-finite or non-numeric OHLCV"),
+        ({"close": float("inf")}, "non-finite or non-numeric OHLCV"),
+        ({"close": "bad"}, "non-finite or non-numeric OHLCV"),
+        ({"date": "bad"}, "invalid timestamp"),
+        (
+            {"date": pd.Timestamp("2026-10-05 09:16:01", tz="Asia/Kolkata")},
+            "non-minute timestamp",
+        ),
+        (
+            {"date": pd.Timestamp("2026-10-05 09:16:00.001", tz="Asia/Kolkata")},
+            "non-minute timestamp",
+        ),
+    ],
 )
-def test_bad_candles_rejected(change):
-    with pytest.raises(ValueError):
+def test_bad_candles_are_skipped_and_audited(change, reason):
+    skipped = []
+    frame = normalize_candles(
+        [candle(), candle("2026-10-05 09:16", **change)],
+        INSTRUMENT,
+        pd.Timestamp("2026-10-05", tz="Asia/Kolkata"),
+        pd.Timestamp("2026-10-06", tz="Asia/Kolkata"),
+        skipped=skipped,
+    )
+    assert frame.timestamp.dt.strftime("%H:%M").tolist() == ["09:15"]
+    assert frame.volume.tolist() == [123]
+    assert len(skipped) == 1
+    assert skipped[0]["symbol"] == "RELIANCE"
+    assert skipped[0]["instrument_token"] == 738561
+    assert any(reason in entry for entry in skipped[0]["reasons"])
+    json.dumps(skipped, allow_nan=False)
+
+
+def test_skipped_candle_audit_does_not_expose_other_response_fields():
+    skipped = []
+    frame = normalize_candles(
+        [
+            candle(),
+            candle("2026-10-05 09:16", high=99, api_key="private_key"),
+            candle("2026-10-05 09:17", high=99),
+            candle("2026-10-05 09:18", volume=-1),
+            candle(date="private_token"),
+        ],
+        INSTRUMENT,
+        pd.Timestamp("2026-10-05", tz="Asia/Kolkata"),
+        pd.Timestamp("2026-10-06", tz="Asia/Kolkata"),
+        skipped=skipped,
+    )
+    assert len(frame) == 1 and len(skipped) == 4
+    assert skipped[0]["timestamp"] == "2026-10-05T09:16:00+05:30"
+    assert skipped[0]["high"] == 99
+    assert skipped[-1]["timestamp"] is None
+    assert skipped[-1]["reasons"] == ["invalid timestamp"]
+    audit = json.dumps(skipped, allow_nan=False)
+    assert "private_key" not in audit and "private_token" not in audit
+
+
+def test_missing_candle_fields_report_request_context():
+    record = candle()
+    del record["high"]
+    with pytest.raises(ValueError, match="RELIANCE.*missing required fields: high"):
         normalize_candles(
-            [candle(**change)],
+            [record],
             INSTRUMENT,
             pd.Timestamp("2026-10-05", tz="Asia/Kolkata"),
             pd.Timestamp("2026-10-06", tz="Asia/Kolkata"),
         )
+
+
+def test_hdfcbank_bad_opening_candle_is_skipped_and_saved_in_audit(tmp_path):
+    client = FakeKite()
+    selected = pd.DataFrame(
+        [{**INSTRUMENT, "tradingsymbol": "HDFCBANK", "instrument_token": 341249}]
+    )
+    client.historical_data = lambda *args, **kwargs: [
+        candle(
+            "2024-06-25 09:15",
+            open=835.6,
+            high=839.8,
+            low=837.4,
+            close=839.6,
+            volume=370096,
+        ),
+        candle("2024-06-25 09:16"),
+    ]
+    result = download_kite_minutes(
+        client, selected, "2024-06-25", "2024-06-25", sleep=lambda _: None
+    )
+    assert result.candles.timestamp.dt.strftime("%H:%M").tolist() == ["09:16"]
+    assert result.manifest["skipped_candle_count"] == 1
+    assert result.manifest["coverage"][0]["skipped_candles"] == 1
+    skipped = result.manifest["skipped_candles"][0]
+    assert skipped["symbol"] == "HDFCBANK"
+    assert skipped["timestamp"] == "2024-06-25T09:15:00+05:30"
+    assert skipped["reasons"] == ["low above open/close/high"]
+    destination = save_kite_download(result, root=tmp_path)
+    saved = json.loads((destination / "download_manifest.json").read_text())
+    assert saved["skipped_candles"] == [skipped]
+    with zipfile.ZipFile(io.BytesIO(result.to_zip())) as archive:
+        exported = json.loads(archive.read("download_manifest.json"))
+        assert exported["skipped_candles"] == [skipped]
+
+
+def test_downloads_all_instruments_before_processing(monkeypatch):
+    import trading_system.data.kite_downloader as downloader
+
+    client = FakeKite()
+    selected = pd.DataFrame(
+        [INSTRUMENT, {**INSTRUMENT, "tradingsymbol": "TCS", "instrument_token": 123}]
+    )
+    original = downloader.normalize_candles
+    processed = []
+
+    def normalize(*args, **kwargs):
+        assert len(client.calls) == 6
+        processed.append(args[1]["tradingsymbol"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(downloader, "normalize_candles", normalize)
+    progress = []
+    result = download_kite_minutes(
+        client,
+        selected,
+        "2026-06-01",
+        "2026-10-03",
+        now="2026-10-05 12:00",
+        sleep=lambda _: None,
+        progress=lambda fraction, message: progress.append(fraction),
+    )
+    assert processed == ["RELIANCE"] * 3 + ["TCS"] * 3
+    assert progress == sorted(progress) and progress[-1] == 1
+    assert len(result.candles) == 6
+
+
+def test_provider_date_limit_is_clear_and_not_retried():
+    from kiteconnect.exceptions import InputException
+
+    client = FakeKite()
+    original = client.historical_data
+
+    def limited(*args, **kwargs):
+        original(*args, **kwargs)
+        raise InputException("private_token interval exceeds max limit: 60 days")
+
+    client.historical_data = limited
+    with pytest.raises(RuntimeError, match="limited to 60 days per request") as error:
+        download_kite_minutes(
+            client,
+            instruments(),
+            "2022-09-01",
+            "2026-10-03",
+            now="2026-10-05 12:00",
+            sleep=lambda _: None,
+        )
+    assert len(client.calls) == 1
+    assert client.calls[0][1] == datetime(2022, 9, 1)
+    assert client.calls[0][2] == datetime(2022, 10, 30, 23, 59, 59)
+    assert "date-window request" in str(error.value)
+    assert "private_token" not in str(error.value)
 
 
 def test_retries_and_auth_failure_does_not_retry():
@@ -185,7 +361,7 @@ def test_configured_delay_applies_across_stocks_and_date_batches():
     result = download_kite_minutes(
         client,
         selected,
-        "2026-08-01",
+        "2026-07-01",
         "2026-09-05",
         now="2026-10-05 12:00",
         request_delay=2.5,

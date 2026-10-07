@@ -301,6 +301,10 @@ def render_kite_download():
             )
             end = right.date_input("End date (inclusive)", today, max_value=today)
             st.text_input("Candle interval", "1 minute", disabled=True)
+            st.caption(
+                "Downloads in batches of up to 60 calendar days per instrument, "
+                "then processes the responses. Inconsistent candles are skipped."
+            )
             label = st.text_input(
                 "Dataset label (optional)",
                 help="Letters, digits, underscores and hyphens",
@@ -349,6 +353,12 @@ def render_kite_download():
     result = st.session_state.get("kite_download")
     if result is not None:
         st.success(f"Saved {len(result.candles):,} one-minute candles locally")
+        skipped = result.manifest.get("skipped_candle_count", 0)
+        if skipped:
+            st.warning(
+                f"Skipped {skipped:,} inconsistent candles. Details are in "
+                "Download coverage and download_manifest.json."
+            )
         st.code(str(result.path), language=None)
         st.caption(
             "Timestamps are candle starts in Asia/Kolkata. Live minute excluded; missing minutes not filled. The backtester requires five-minute bars and daily context."

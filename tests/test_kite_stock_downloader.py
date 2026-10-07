@@ -322,3 +322,36 @@ def test_failed_stock_does_not_save_partial_results(environment, capsys):
     assert "private_token" not in printed.out + printed.err
     assert "test_key" not in printed.out + printed.err
     assert len(client.calls) == 1 and not output.exists()
+
+
+def test_invalid_candle_is_skipped_and_cli_saves_valid_results(environment, capsys):
+    _, _, client, output = environment
+    original = client.historical_data
+
+    def invalid(token, *args, **kwargs):
+        records = original(token, *args, **kwargs)
+        if token == 2:
+            records.append(
+                {
+                    **records[0],
+                    "date": records[0]["date"] + pd.Timedelta(minutes=1),
+                    "high": 99,
+                    "private_field": "private_token test_key",
+                }
+            )
+        return records
+
+    client.historical_data = invalid
+    cli.main(["--start", "2026-10-05", "--output", str(output)], now="2026-10-06 10:00")
+    printed = capsys.readouterr()
+    assert "Skipped 1 invalid candles" in printed.out
+    assert "private_token" not in printed.out + printed.err
+    assert "test_key" not in printed.out + printed.err
+    assert len(client.calls) == 2
+    folder = next(output.iterdir())
+    manifest_text = (folder / "download_manifest.json").read_text()
+    manifest = json.loads(manifest_text)
+    assert manifest["skipped_candle_count"] == 1
+    assert manifest["skipped_candles"][0]["symbol"] == "TCS"
+    assert "private_token" not in manifest_text and "test_key" not in manifest_text
+    assert len(pd.read_csv(folder / "candles_1minute.csv")) == 2
