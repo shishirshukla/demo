@@ -9,10 +9,17 @@ import plotly.express as px
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from frontend.converted_backtest import render_converted_backtest
 from frontend.kite_backtest import render_saved_kite_backtest
 from frontend.kite_download import capture_kite_callback, render_kite_download
+from frontend.research_flow import (
+    render_daily_screener,
+    render_diagnostics,
+    render_stock_trades,
+)
 from trading_system.backtest import BacktestEngine
 from trading_system.backtest.metrics import metrics, period_returns
+from trading_system.backtest.preparation import prepare_backtest
 from trading_system.backtest.walk_forward import (
     evaluate_walk_forward,
     robustness,
@@ -21,7 +28,12 @@ from trading_system.backtest.walk_forward import (
 from trading_system.config import load_settings
 from trading_system.data import demo_dataset
 from trading_system.data.historical import Dataset
-from trading_system.reports.performance import breakdowns, overlap, portfolio_series
+from trading_system.reports.performance import (
+    breakdowns,
+    overlap,
+    portfolio_series,
+    signal_export,
+)
 
 st.set_page_config(page_title="NIFTY · Regime Lab", page_icon="📈", layout="wide")
 st.markdown(
@@ -49,11 +61,19 @@ def chart(fig):
     st.plotly_chart(fig, width="stretch")
 
 
-def bundle(results):
+def bundle(results, progress=None):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         summaries = []
-        for r in results:
+        archive.writestr(
+            "daily_screener.csv", results[0].daily_screener.to_csv(index=False)
+        )
+        for i, r in enumerate(results):
+            if progress:
+                progress(
+                    i / len(results),
+                    f"Exporting {r.slippage_bps:g} bps: trades, signals, diagnostics and portfolio reports",
+                )
             prefix = f"{r.slippage_bps:g}bps"
             m = metrics(r)
             summaries.append({"slippage_bps": r.slippage_bps, **m})
@@ -61,6 +81,8 @@ def bundle(results):
                 "trades": r.trades,
                 "equity": r.equity,
                 "regimes": r.regimes,
+                "signals": signal_export(r),
+                "trigger_diagnostics": r.diagnostics,
                 "portfolio_daily": portfolio_series(r).reset_index(),
                 "monthly_returns": period_returns(r, "ME").reset_index(),
                 "yearly_returns": period_returns(r, "YE").reset_index(),
@@ -88,6 +110,8 @@ def bundle(results):
         archive.writestr(
             "slippage_comparison.csv", pd.DataFrame(summaries).to_csv(index=False)
         )
+    if progress:
+        progress(1.0, "Results ZIP ready")
     return buffer.getvalue()
 
 
@@ -108,7 +132,13 @@ if page == "Download Kite data":
 
 with st.sidebar:
     source = st.radio(
-        "Data source", ["Synthetic demo", "Saved Kite downloads", "Upload CSV files"]
+        "Data source",
+        [
+            "Synthetic demo",
+            "Generated Kite candles",
+            "Saved Kite downloads",
+            "Upload CSV files",
+        ],
     )
     settings_file = st.file_uploader("Optional settings YAML", type=["yaml", "yml"])
     try:
@@ -119,6 +149,7 @@ with st.sidebar:
     mode = st.selectbox(
         "Execution timeframe",
         ["daily", "intraday", "hybrid"],
+        index=2,
         help="Hybrid executes both swing and intraday strategies using 5-minute fills.",
     )
     st.markdown("#### Strategies")
@@ -151,7 +182,16 @@ with st.sidebar:
     dataset = None
     data_selection = {"source": source}
     if source == "Synthetic demo":
+        demo_status = st.progress(
+            0.0, text="Loading seeded synthetic daily and 5-minute candles"
+        )
         dataset = get_demo()
+        demo_status.progress(
+            1.0,
+            text="Synthetic data ready: daily warmup and 30 complete 5-minute sessions",
+        )
+    elif source == "Generated Kite candles":
+        dataset, data_selection = render_converted_backtest(mode)
     elif source == "Saved Kite downloads":
         dataset, data_selection = render_saved_kite_backtest(mode)
     else:
@@ -167,8 +207,20 @@ with st.sidebar:
         }
         if all(uploads[key] is not None for key in ["daily", "benchmark", "universe"]):
             try:
-                frames = {k: pd.read_csv(v) if v else None for k, v in uploads.items()}
+                upload_status = st.progress(
+                    0.0, text="Reading uploaded candles and universe"
+                )
+                frames = {}
+                for i, (key, value) in enumerate(uploads.items()):
+                    upload_status.progress(
+                        i / len(uploads) * 0.9, text=f"Reading uploaded {key}"
+                    )
+                    frames[key] = pd.read_csv(value) if value else None
+                upload_status.progress(
+                    0.95, text="Validating daily and 5-minute data contracts"
+                )
                 dataset = Dataset(**frames).validate()
+                upload_status.progress(1.0, text="Uploaded data ready")
             except Exception as exc:
                 st.error(f"Cannot load data: {exc}")
     start, end = None, None
@@ -184,6 +236,10 @@ with st.sidebar:
         )
         if len(selected) == 2:
             start, end = map(str, selected)
+    if mode != "hybrid":
+        st.info(
+            "Hybrid runs all five strategies using daily screening and 5-minute execution. The selected mode skips the other timeframe’s strategies."
+        )
     run = st.button(
         "Run backtest →", type="primary", width="stretch", disabled=dataset is None
     )
@@ -198,15 +254,43 @@ st.title("Market regimes. Measured results.")
 st.caption("Five strategies · one risk framework · reproducible backtests")
 if run:
     try:
-        with st.spinner("Evaluating strategies and all three slippage scenarios…"):
-            st.session_state["results"] = [
-                BacktestEngine(settings).run(dataset, bps, start, end, mode)
-                for bps in [3, 5, 10]
-            ]
-            st.session_state["last_data_selection"] = data_selection
-            st.session_state["last_dataset"] = dataset
-            st.session_state["last_mode"] = mode
-            st.session_state["last_range"] = (start, end)
+        status = st.progress(
+            0.0, text="Preparing daily screener and 5-minute execution features"
+        )
+        prepared = prepare_backtest(
+            dataset,
+            settings,
+            start,
+            end,
+            mode,
+            progress=lambda f, m: status.progress(0.35 * f, text=m),
+        )
+        completed = []
+        scenarios = settings["costs"]["slippage_scenarios"]
+        for i, bps in enumerate(scenarios):
+            completed.append(
+                BacktestEngine(settings).run(
+                    dataset,
+                    bps,
+                    start,
+                    end,
+                    mode,
+                    prepared=prepared,
+                    progress=lambda f, m, i=i: status.progress(
+                        0.35 + 0.65 * (i + f) / len(scenarios), text=m
+                    ),
+                )
+            )
+        st.session_state["results"] = completed
+        st.session_state["last_data_selection"] = data_selection
+        st.session_state["last_dataset"] = dataset
+        st.session_state["last_mode"] = mode
+        st.session_state["last_range"] = (start, end)
+        st.session_state.pop("results_zip", None)
+        status.progress(
+            1.0,
+            text=f"Complete: {len(scenarios)} scenarios · {len(completed[0].daily_screener):,} daily screening rows",
+        )
     except Exception as exc:
         st.error(f"Backtest failed: {exc}")
 
@@ -232,14 +316,17 @@ st.caption(
     f"Showing last completed run: {st.session_state['last_mode']} · {st.session_state['last_range'][0]} to {st.session_state['last_range'][1]}. Run again to apply changed controls."
 )
 last_selection = st.session_state.get("last_data_selection", {})
-if last_selection.get("source") == "Saved Kite downloads":
+if last_selection.get("source") in ("Saved Kite downloads", "Generated Kite candles"):
     st.caption(
         "Last completed run used downloaded stocks: "
         + ", ".join(last_selection["symbols"])
         + " / benchmark "
         + last_selection["benchmark"]
     )
-scenario = st.selectbox("Slippage scenario", [3, 5, 10], index=1)
+scenario_values = [x.slippage_bps for x in results]
+scenario = st.selectbox(
+    "Slippage scenario", scenario_values, index=1 if len(scenario_values) > 1 else 0
+)
 r = next(x for x in results if x.slippage_bps == scenario)
 m = metrics(r)
 columns = st.columns(5)
@@ -255,12 +342,41 @@ for column, label, value in zip(
     ],
 ):
     column.metric(label, value)
-st.download_button(
-    "Download results · CSV + JSON ZIP",
-    data=bundle(results),
-    file_name="nifty_backtest.zip",
-    mime="application/zip",
+if st.button("Prepare results ZIP"):
+    export_status = st.progress(0.0, text="Exporting daily screener and results")
+    st.session_state["results_zip"] = bundle(
+        results, lambda f, m: export_status.progress(f, text=m)
+    )
+if "results_zip" in st.session_state:
+    st.download_button(
+        "Download results · CSV + JSON ZIP",
+        data=st.session_state["results_zip"],
+        file_name="nifty_backtest.zip",
+        mime="application/zip",
+    )
+screen = st.radio(
+    "Result screen",
+    [
+        "Run diagnostics",
+        "Daily screener",
+        "Stock trade details",
+        "Portfolio and research",
+    ],
+    horizontal=True,
 )
+if screen == "Run diagnostics":
+    render_diagnostics(
+        r, st.session_state["last_mode"], st.session_state["last_dataset"]
+    )
+    st.stop()
+if screen == "Daily screener":
+    render_daily_screener(r, st.session_state["last_dataset"].universe)
+    st.stop()
+if screen == "Stock trade details":
+    render_stock_trades(
+        r, st.session_state["last_dataset"], st.session_state["last_mode"]
+    )
+    st.stop()
 overview, strategies, trades_tab, regimes_tab, research = st.tabs(
     [
         "Portfolio",
@@ -417,17 +533,27 @@ with research:
             )
         else:
             try:
-                with st.spinner("Evaluating chronological folds…"):
+                with st.container():
+                    validation_status = st.progress(
+                        0.0, text="Evaluating chronological folds"
+                    )
                     st.dataframe(
                         evaluate_walk_forward(
-                            ds, r.settings, folds, st.session_state["last_mode"]
+                            ds,
+                            r.settings,
+                            folds,
+                            st.session_state["last_mode"],
+                            progress=lambda f, m: validation_status.progress(f, text=m),
                         )
                     )
             except ValueError as exc:
                 st.error(str(exc))
     st.markdown("**Parameter neighborhood · momentum stop ATR**")
     if st.button("Compare 1.5 / 2.0 / 2.5 ATR"):
-        with st.spinner("Evaluating broad parameter neighborhood…"):
+        with st.container():
+            neighborhood_status = st.progress(
+                0.0, text="Evaluating parameter neighborhood"
+            )
             ds = st.session_state["last_dataset"]
             st.dataframe(
                 robustness(
@@ -438,6 +564,7 @@ with research:
                     [1.5, 2.0, 2.5],
                     *st.session_state["last_range"],
                     mode=st.session_state["last_mode"],
+                    progress=lambda f, m: neighborhood_status.progress(f, text=m),
                 )
             )
     st.caption(

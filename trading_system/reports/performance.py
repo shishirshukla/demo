@@ -59,11 +59,32 @@ def overlap(result):
     return active.T.dot(active) / max(1, len(active))
 
 
-def export_results(results, directory, dataset=None):
+def signal_export(result, symbol=None):
+    """Keep nested signal features machine-readable in CSV exports."""
+    table = result.signal_log
+    if symbol is not None:
+        table = table.loc[table.symbol.eq(symbol)]
+    table = table.copy()
+    if "features" in table:
+        table["features"] = table.features.map(
+            lambda values: pd.Series(values).to_json(
+                date_format="iso", double_precision=15
+            )
+        )
+    return table
+
+
+def export_results(results, directory, dataset=None, progress=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     summaries = []
-    for r in results:
+    results[0].daily_screener.to_csv(directory / "daily_screener.csv", index=False)
+    for i, r in enumerate(results):
+        if progress:
+            progress(
+                0.8 * i / len(results),
+                f"Writing {r.slippage_bps:g} bps reports: trades, signals, trigger diagnostics, portfolio",
+            )
         folder = directory / f"slippage_{r.slippage_bps:g}bps"
         folder.mkdir(exist_ok=True)
         summary = {"slippage_bps": r.slippage_bps, **metrics(r)}
@@ -72,6 +93,8 @@ def export_results(results, directory, dataset=None):
             "equity": r.equity,
             "trades": r.trades,
             "regimes": r.regimes,
+            "signals": signal_export(r),
+            "trigger_diagnostics": r.diagnostics,
             **{f"by_{k}": v for k, v in breakdowns(r).items()},
         }.items():
             table.to_csv(folder / f"{name}.csv", index=False)
@@ -106,6 +129,8 @@ def export_results(results, directory, dataset=None):
             json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
         )
     pd.DataFrame(summaries).to_csv(directory / "slippage_comparison.csv", index=False)
+    if progress:
+        progress(0.85, "Computing dataset fingerprints for reproducible reports")
     fingerprints = {}
     if dataset:
         for name in [
@@ -134,4 +159,6 @@ def export_results(results, directory, dataset=None):
         ),
         encoding="utf-8",
     )
+    if progress:
+        progress(1.0, "Reports and daily screener saved")
     return directory

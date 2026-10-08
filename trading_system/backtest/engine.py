@@ -1,20 +1,18 @@
 import logging
-from dataclasses import asdict, dataclass
+from bisect import bisect_left
+from collections import Counter
+from dataclasses import asdict, dataclass, field
+from time import monotonic
 
 import pandas as pd
 
-from trading_system.data.features import (
-    daily_features,
-    eligible_rows,
-    intraday_features,
-)
 from trading_system.models import Position, Trade
 from trading_system.portfolio import RiskManager
-from trading_system.regime import RegimeClassifier
 from trading_system.strategies import build_strategies
 
 from .costs import CostModel
 from .fills import entry_fill, protective_fill
+from .preparation import prepare_backtest
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +27,9 @@ class BacktestResult:
     slippage_bps: float
     synthetic: bool
     settings: dict
+    daily_screener: pd.DataFrame = field(default_factory=pd.DataFrame)
+    signal_log: pd.DataFrame = field(default_factory=pd.DataFrame)
+    diagnostics: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 class BacktestEngine:
@@ -44,13 +45,35 @@ class BacktestEngine:
             strategies if strategies is not None else build_strategies(settings)
         )
 
-    def run(self, dataset, slippage_bps=5, start=None, end=None, mode="daily"):
-        if mode not in ("daily", "hybrid", "intraday"):
-            raise ValueError("mode must be daily, intraday, or hybrid")
-        dataset.validate()
+    def run(
+        self,
+        dataset,
+        slippage_bps=5,
+        start=None,
+        end=None,
+        mode="daily",
+        *,
+        progress=None,
+        prepared=None,
+    ):
+        if prepared is None:
+            prepared = prepare_backtest(
+                dataset,
+                self.settings,
+                start,
+                end,
+                mode,
+                progress=lambda f, m: progress(f * 0.4, m) if progress else None,
+            )
+        elif (
+            prepared.dataset_id != id(dataset)
+            or prepared.settings != self.settings
+            or (prepared.start, prepared.end, prepared.mode) != (start, end, mode)
+        ):
+            raise ValueError(
+                "Prepared features do not match this dataset, settings or research period"
+            )
         intraday_mode = mode != "daily"
-        if intraday_mode and dataset.intraday is None:
-            raise ValueError("Intraday/hybrid mode requires 5-minute bars")
         self.cost = CostModel(self.settings["costs"], slippage_bps)
         self.risk = RiskManager(self.settings["portfolio"])
         self.positions, self.pending, self.exit_pending = {}, [], {}
@@ -60,60 +83,26 @@ class BacktestEngine:
         self.volume_today = 0.0
         self.turnover_day = None
         self.strategy_map = {s.name: s for s in self.strategies}
-        classifier = RegimeClassifier(self.settings["regime"])
-        benchmark = classifier.prepare(dataset.benchmark)
-        daily = daily_features(dataset.daily, benchmark, self.settings)
-        daily_groups = {t: f for t, f in daily.groupby("timestamp")}
-        benchmark_rows = {r.timestamp: r for _, r in benchmark.iterrows()}
-        times = sorted(daily_groups)
-        daily_snapshots, regime_map = {}, {}
-        for t in times:
-            eligible = eligible_rows(
-                daily_groups[t], dataset.universe, t, self.settings
-            )
-            daily_snapshots[t] = eligible
-            regime_map[t] = classifier.classify(benchmark_rows.get(t), eligible)
-        events = [(t, 1, "daily", f) for t, f in daily_groups.items()]
-        intraday_bench = {}
-        if intraday_mode:
-            bars = intraday_features(dataset.intraday, self.settings)
-            # Explicit complete-session contract prevents invented end-of-day fills.
-            for _, session in bars.groupby(["symbol", "session"]):
-                expected = set(range(560, 931, 5))
-                if set(session.minute) != expected:
-                    raise ValueError(
-                        "Intraday research requires complete 09:20–15:30 close-timestamp sessions per symbol (75 bars)"
-                    )
-            events += [(t, 0, "intraday", f) for t, f in bars.groupby("timestamp")]
-            if dataset.benchmark_intraday is not None:
-                bf = intraday_features(dataset.benchmark_intraday, self.settings)
-                for _, r in bf.iterrows():
-                    prior = benchmark[benchmark.timestamp < r.timestamp]
-                    r["previous_close"] = (
-                        prior.iloc[-1].close if len(prior) else float("nan")
-                    )
-                    intraday_bench[r.timestamp] = r
-            first_exec, last_exec = bars.timestamp.min(), bars.timestamp.max()
-        else:
-            first_exec, last_exec = daily.timestamp.min(), daily.timestamp.max()
-        lower = (
-            pd.Timestamp(start, tz="Asia/Kolkata") if start else first_exec.normalize()
+        daily_snapshots, regime_map = prepared.snapshots, prepared.regimes
+        benchmark_rows, intraday_bench = (
+            prepared.benchmark_rows,
+            prepared.intraday_benchmark,
         )
-        upper = (
-            pd.Timestamp(end, tz="Asia/Kolkata") + pd.Timedelta(days=1)
-            if end
-            else last_exec + pd.Timedelta(seconds=1)
-        )
-        events = [
-            e
-            for e in events
-            if lower <= e[0] < upper
-            and (not intraday_mode or first_exec.normalize() <= e[0] <= last_exec)
-        ]
-        if not events:
-            raise ValueError("No tradable data in requested date range")
+        times = sorted(daily_snapshots)
+        events = prepared.events
+        self.signal_records, self.signal_records_by_id = [], {}
+        self.diagnostic_counts = Counter()
+        last_progress = 0.0
         self.execution_rows = {}
-        for t, _, kind, raw in sorted(events, key=lambda e: (e[0], e[1])):
+        for event_index, (t, _, kind, indices) in enumerate(events):
+            raw = (prepared.daily if kind == "daily" else prepared.bars).iloc[indices]
+            if progress and (monotonic() - last_progress >= 0.4 or event_index == 0):
+                progress(
+                    0.4 + 0.56 * event_index / len(events),
+                    f"{slippage_bps:g} bps · {t:%Y-%m-%d %H:%M} · {event_index + 1:,}/{len(events):,} events · "
+                    f"{len(self.signal_records):,} signals · {len(self.trades):,} closed trades · {len(self.positions)} open",
+                )
+                last_progress = monotonic()
             if self.turnover_day != t.date():
                 self.turnover_day, self.volume_today = t.date(), 0
             # Start-of-session equity uses preceding known prices, before the gap.
@@ -123,25 +112,23 @@ class BacktestEngine:
                 regime = regime_map[t]
                 b = benchmark_rows.get(t)
             else:
-                prior_times = [x for x in times if x < t]
-                prior_t = prior_times[-1] if prior_times else None
-                if prior_t is None:
+                prior_index = bisect_left(times, t) - 1
+                if prior_index < 0:
                     continue
-                snapshot = daily_snapshots[prior_t].rename(
-                    columns={
-                        "close": "daily_close",
-                        "open": "daily_open",
-                        "high": "daily_high",
-                        "low": "daily_low",
-                        "volume": "daily_volume",
-                        "timestamp": "daily_timestamp",
-                    }
-                )
+                prior_t = times[prior_index]
+                snapshot = prepared.contexts.get(t.date())
+                if snapshot is None:
+                    snapshot = prepared.daily.iloc[:0].rename(
+                        columns={"timestamp": "daily_timestamp", "close": "daily_close"}
+                    )
+                    # Preserve the feature schema even during liquidity warmup.
+                    snapshot = snapshot.merge(
+                        dataset.universe[["symbol", "sector", "lot_size"]], on="symbol"
+                    )
                 keep = [
                     x for x in snapshot.columns if x not in raw.columns or x == "symbol"
                 ]
                 rows = raw.merge(snapshot[keep], on="symbol", how="inner")
-                # No stale daily signal context across gaps in supplied daily data.
                 if (t.date() - prior_t.date()).days > 7:
                     raise ValueError("Daily context is stale for intraday session")
                 regime = regime_map[prior_t]
@@ -161,7 +148,7 @@ class BacktestEngine:
                 }
             )
             execution = kind == "intraday" if intraday_mode else kind == "daily"
-            raw_by_symbol = {r.symbol: r for _, r in raw.iterrows()}
+            raw_by_symbol = {r.symbol: r for r in raw.itertuples(index=False)}
             if execution:
                 for symbol, row in raw_by_symbol.items():
                     self.marks[symbol] = float(row.open)
@@ -176,34 +163,41 @@ class BacktestEngine:
                     position, row = self.positions[symbol], raw_by_symbol[symbol]
                     # Only open gaps may release slots before entry orders.
                     # Intrabar stops/targets become known after entry sizing.
-                    open_bar = row.copy()
-                    open_bar["high"] = open_bar["low"] = row.open
+                    open_bar = row._replace(high=row.open, low=row.open)
                     price, reason = protective_fill(position, open_bar)
                     if reason:
                         self.close(symbol, price, t, reason)
                 queued, self.pending = self.pending, []
-                date = t.tz_localize(None).normalize()
-                membership = dataset.universe
-                active_symbols = set(
-                    membership.loc[
-                        (
-                            membership.active_from.isna()
-                            | (membership.active_from <= date)
-                        )
-                        & (
-                            membership.active_to.isna() | (membership.active_to >= date)
-                        ),
-                        "symbol",
-                    ]
-                )
+                if queued:
+                    date = t.tz_localize(None).normalize()
+                    membership = dataset.universe
+                    active_symbols = set(
+                        membership.loc[
+                            (
+                                membership.active_from.isna()
+                                | (membership.active_from <= date)
+                            )
+                            & (
+                                membership.active_to.isna()
+                                | (membership.active_to >= date)
+                            ),
+                            "symbol",
+                        ]
+                    )
                 new_symbols = set()
                 for signal in sorted(
                     queued, key=lambda s: (-s.score, s.strategy, s.symbol)
                 ):
                     if signal.symbol not in raw_by_symbol:
+                        self.signal_outcome(
+                            signal, "expired", "missing_execution_bar", t
+                        )
                         continue
                     if signal.symbol not in active_symbols:
                         self.risk.rejections["inactive_membership"] += 1
+                        self.signal_outcome(
+                            signal, "rejected", "inactive_membership", t
+                        )
                         continue
                     if signal.metadata["timeframe"] == "intraday":
                         cutoff = signal.metadata.get("force_exit", "15:10")
@@ -212,15 +206,22 @@ class BacktestEngine:
                             or t.strftime("%H:%M") >= cutoff
                             or t - signal.timestamp > pd.Timedelta(minutes=5)
                         ):
+                            self.signal_outcome(
+                                signal, "expired", "intraday_cutoff_or_expired", t
+                            )
                             continue
                     elif (
                         t.date() <= signal.timestamp.date()
                         or (t.date() - signal.timestamp.date()).days > 7
                     ):
+                        self.signal_outcome(signal, "expired", "daily_order_expired", t)
                         continue
                     bar = raw_by_symbol[signal.symbol]
                     raw_fill = entry_fill(signal, bar)
                     if raw_fill is None:
+                        self.signal_outcome(
+                            signal, "unfilled", "entry_price_not_reached", t
+                        )
                         continue
                     price = self.cost.execution_price(raw_fill, signal.side == "LONG")
                     intra = signal.metadata["timeframe"] == "intraday"
@@ -228,6 +229,7 @@ class BacktestEngine:
                     def fee(qty):
                         return self.cost.fees(price, qty, signal.side == "LONG", intra)
 
+                    before_rejections = self.risk.rejections.copy()
                     order = self.risk.approve(
                         signal,
                         price,
@@ -237,7 +239,20 @@ class BacktestEngine:
                         fee,
                     )
                     if order is None:
+                        reason = next(
+                            iter(self.risk.rejections - before_rejections),
+                            "risk_rejected",
+                        )
+                        self.signal_outcome(signal, "rejected", reason, t)
                         continue
+                    self.signal_outcome(
+                        signal,
+                        "filled",
+                        "approved",
+                        t,
+                        fill_price=price,
+                        quantity=order.quantity,
+                    )
                     position = Position(
                         signal,
                         order.quantity,
@@ -284,7 +299,12 @@ class BacktestEngine:
                         )
             # Daily trailing stops are updated after the day's prices are known.
             # Intraday exits use closing values, then next-bar open execution.
-            feature_by_symbol = {r.symbol: r for _, r in rows.iterrows()}
+            feature_by_symbol = {
+                symbol: rows.loc[rows.symbol.eq(symbol)].iloc[0]
+                for symbol, position in self.positions.items()
+                if self.strategy_map[position.signal.strategy].timeframe == kind
+                and rows.symbol.eq(symbol).any()
+            }
             for symbol, p in list(self.positions.items()):
                 strategy = self.strategy_map[p.signal.strategy]
                 if strategy.timeframe != kind or symbol not in feature_by_symbol:
@@ -315,7 +335,71 @@ class BacktestEngine:
                     "%H:%M"
                 ) >= strategy.parameters.get("force_exit", "15:10"):
                     continue
-                self.pending += strategy.generate_signals(rows, b, regime, t)
+                strategy.last_counts = {}
+                signals = (
+                    [] if rows.empty else strategy.generate_signals(rows, b, regime, t)
+                )
+                counts = strategy.last_counts or {
+                    "selected": len(signals),
+                    "conditions_not_met": len(rows) - len(signals),
+                }
+                selected_count = counts.get("selected", 0)
+                counts["selected"] = len(signals)
+                if selected_count > len(signals):
+                    counts["invalid_signal_prices"] = selected_count - len(signals)
+                if rows.empty:
+                    counts["no_eligible_daily_context"] = 1
+                for reason, count in counts.items():
+                    self.diagnostic_counts[(t.date(), strategy.name, reason)] += count
+                for signal in signals:
+                    context = rows.loc[rows.symbol.eq(signal.symbol)].iloc[0]
+                    signal_id = len(self.signal_records) + 1
+                    signal.metadata["signal_id"] = signal_id
+                    signal.metadata["screen_timestamp"] = context.get(
+                        "daily_timestamp", t
+                    )
+                    record = {
+                        "signal_id": signal_id,
+                        "timestamp": t,
+                        "screen_timestamp": signal.metadata["screen_timestamp"],
+                        "symbol": signal.symbol,
+                        "strategy": signal.strategy,
+                        "timeframe": strategy.timeframe,
+                        "side": signal.side,
+                        "order_type": signal.order_type,
+                        "entry_price": signal.entry_price,
+                        "stop_price": signal.stop_price,
+                        "target_price": signal.target_price,
+                        "score": signal.score,
+                        "regime": regime.label,
+                        "status": "pending",
+                        "reason": "awaiting_next_bar",
+                        "execution_time": pd.NaT,
+                        "fill_price": None,
+                        "quantity": None,
+                        "exit_time": pd.NaT,
+                        "exit_reason": None,
+                        "net_pnl": None,
+                        "features": {
+                            **context.to_dict(),
+                            **(
+                                {
+                                    f"trigger_benchmark_{key}": b.get(key)
+                                    for key in (
+                                        "timestamp",
+                                        "close",
+                                        "previous_close",
+                                        "vwap",
+                                    )
+                                }
+                                if b is not None
+                                else {}
+                            ),
+                        },
+                    }
+                    self.signal_records.append(record)
+                    self.signal_records_by_id[signal_id] = record
+                self.pending += signals
             self.risk.update(t, self.equity())
             self.curve.append(
                 {
@@ -328,6 +412,13 @@ class BacktestEngine:
                     "strategy_exposure": self.strategy_exposure(),
                 }
             )
+        if progress:
+            progress(
+                0.97,
+                f"{slippage_bps:g} bps · Closing remaining positions and building screening / signal reports",
+            )
+        for signal in self.pending:
+            self.signal_outcome(signal, "expired", "end_of_data", events[-1][0])
         for symbol in list(self.positions):
             t, row = self.execution_rows[symbol]
             self.close(symbol, row.close, t, "end_of_data")
@@ -345,6 +436,11 @@ class BacktestEngine:
             slippage_bps,
             self.equity(),
         )
+        if progress:
+            progress(
+                1.0,
+                f"{slippage_bps:g} bps complete: {len(self.signal_records):,} signals, {len(self.trades):,} closed trades",
+            )
         columns = list(Trade.__dataclass_fields__)
         return BacktestResult(
             pd.DataFrame(self.curve),
@@ -355,7 +451,52 @@ class BacktestEngine:
             slippage_bps,
             dataset.synthetic,
             self.settings,
+            prepared.screener,
+            pd.DataFrame(
+                self.signal_records,
+                columns=[
+                    "signal_id",
+                    "timestamp",
+                    "screen_timestamp",
+                    "symbol",
+                    "strategy",
+                    "timeframe",
+                    "side",
+                    "order_type",
+                    "entry_price",
+                    "stop_price",
+                    "target_price",
+                    "score",
+                    "regime",
+                    "status",
+                    "reason",
+                    "execution_time",
+                    "fill_price",
+                    "quantity",
+                    "exit_time",
+                    "exit_reason",
+                    "net_pnl",
+                    "features",
+                ],
+            ),
+            pd.DataFrame(
+                [
+                    {
+                        "session": day,
+                        "strategy": strategy,
+                        "reason": reason,
+                        "count": count,
+                    }
+                    for (day, strategy, reason), count in self.diagnostic_counts.items()
+                    if count
+                ],
+                columns=["session", "strategy", "reason", "count"],
+            ),
         )
+
+    def signal_outcome(self, signal, status, reason, timestamp, **values):
+        record = self.signal_records_by_id[signal.metadata["signal_id"]]
+        record.update(status=status, reason=reason, execution_time=timestamp, **values)
 
     def equity(self):
         return (
@@ -426,6 +567,10 @@ class BacktestEngine:
                 m.get("regime", "FLAT"),
                 m.get("volatility_quartile", 0),
                 m.get("liquidity_quartile", 0),
+                p.signal.timestamp,
+                m.get("signal_id", 0),
             )
         )
+        record = self.signal_records_by_id[m["signal_id"]]
+        record.update(exit_time=timestamp, exit_reason=reason, net_pnl=net)
         self.exit_pending.pop(symbol, None)

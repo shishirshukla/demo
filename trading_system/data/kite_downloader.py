@@ -261,9 +261,13 @@ def download_kite_minutes(
                 wait = max(request_delay, (10 if code == 429 else 2) * 2**attempt)
         responses[int(instrument["instrument_token"])].append((first, stop, records))
         if progress:
+            batch_number = (completed - 1) % len(windows) + 1
+            instrument_number = (completed - 1) // len(windows) + 1
             progress(
                 0.9 * completed / total,
-                f"Downloaded {instrument['tradingsymbol']} - {completed}/{total} batches",
+                f"{instrument['tradingsymbol']} - date batch {batch_number}/{len(windows)}; "
+                f"instrument {instrument_number}/{len(selected)}; "
+                f"API request {completed}/{total}",
             )
 
     frames, coverage, skipped = [], [], []
@@ -315,6 +319,8 @@ def download_kite_minutes(
             "request_delay_seconds": request_delay,
             "download_mode": "60-calendar-day batches, then process",
             "request_window_days": REQUEST_WINDOW_DAYS,
+            "date_batches_per_instrument": len(windows),
+            "planned_historical_requests": total,
             "skipped_candle_count": len(skipped),
             "skipped_candles": skipped,
             "timezone": TZ,

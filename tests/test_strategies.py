@@ -163,6 +163,9 @@ def test_opening_momentum_both_directions_and_benchmark_required(side):
     assert signal.side == side
     assert signal.stop_price == (101 if side == "LONG" else 99)
     assert not s.generate_signals(f, None, regime, T)
+    benchmark["vwap"] = float("nan")
+    assert not s.generate_signals(f, benchmark, regime, T)
+    assert s.last_counts["benchmark_vwap_unavailable"] == 1
 
 
 def test_registry_enables_each_strategy_independently():

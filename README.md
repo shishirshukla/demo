@@ -11,7 +11,7 @@ cd E:\Shishir\demo
 .\.venv\Scripts\python.exe -m streamlit run frontend/app.py --server.address 127.0.0.1
 ```
 
-Open **http://localhost:8501**, select a timeframe, and click **Run backtest**. Alternatively run `powershell -ExecutionPolicy Bypass -File .\start-dashboard.ps1`.
+Open **http://localhost:8501** and click **Run backtest**. The dashboard defaults to **hybrid**: daily candles drive screening and all five strategies execute using five-minute candles. Alternatively run `powershell -ExecutionPolicy Bypass -File .\start-dashboard.ps1`.
 
 The synthetic demo is clearly labelled, uses fictional symbols, and is seeded for reproducibility. It exercises the software; its results are not evidence of a trading edge. No data subscription or broker credentials are required.
 
@@ -107,7 +107,12 @@ Kite's maximum of
 for example, 2022-09-01 through 2026-10-03 uses 25 requests per instrument.
 Batch boundaries preserve the full inclusive date range without overlapping
 candles. The manifest records `request_window_days` and empty request windows
-per symbol. The separate
+per symbol. Progress shows the date batch for the current instrument separately
+from the total API request count. For 2022-09-01 through 2026-10-06, there are
+1,497 calendar days: 24 full 60-day batches and one final 57-day batch. With 100
+stocks and `--include-benchmark`, this is 25 batches per instrument × 101
+instruments = 2,525 API requests. Each request fetches one instrument.
+The separate
 [historical API rate limit](https://kite.trade/docs/connect/v3/exceptions/#api-rate-limit)
 is three requests per second.
 Requests wait at least one second before each historical API call; transient
@@ -179,6 +184,54 @@ Use `--credentials-file PATH` to select another credential file with `api_key`
 and `access_token` fields. Tokens are never printed or included in exports.
 The CLI is also available as `python -m trading_system.data.kite_stock_downloader`.
 
+### Split saved minute data into per-symbol five-minute and daily files
+
+Run the converter from the project root. With no arguments it uses the newest
+saved Kite download and creates `data/private/kite_converted/<download-folder>/`:
+
+```bash
+.venv/bin/python scripts/convert_kite_minutes.py
+# Specify a saved download folder or its candles_1minute.csv explicitly.
+.venv/bin/python scripts/convert_kite_minutes.py --input data/private/kite/<download-folder> --output data/private/kite_converted/my_dataset
+# Optionally limit symbols or also split the original one-minute data.
+.venv/bin/python scripts/convert_kite_minutes.py --input data/private/kite/<download-folder> --output data/private/kite_converted/selected --symbols RELIANCE TCS "NIFTY 50" --include-minute
+```
+
+On Windows, replace `.venv/bin/python` with `.\.venv\Scripts\python.exe`.
+The output contains one CSV per symbol, including downloaded benchmark indices:
+
+```text
+<output>/
+  5minute/RELIANCE.csv
+  5minute/TCS.csv
+  5minute/NIFTY_50.csv
+  daily/RELIANCE.csv
+  daily/TCS.csv
+  daily/NIFTY_50.csv
+  1minute/RELIANCE.csv       # only with --include-minute
+  conversion_manifest.json
+```
+
+Each CSV uses `timestamp,symbol,open,high,low,close,volume`; daily files also
+include `turnover`, summed from minute close × volume. Aggregation uses the first
+open, maximum high, minimum low, last close, and summed volume. Input timestamps
+must represent minute **starts**; naive timestamps are interpreted in Asia/Kolkata.
+Five-minute timestamps represent **closes**, from 09:20 to 15:30 IST, and daily
+timestamps use the 15:30 IST close. Only regular-session minutes 09:15–15:29 are
+used. Five-minute candles require all five source minutes; daily candles require
+all 375 minutes. Each symbol retains its own valid dates, without intersecting
+availability with other stocks. Complete five-minute bins from an incomplete day
+are retained; full-session filtering is still needed for an intraday engine run.
+Missing bars are never created. The manifest lists coverage and excluded bins/sessions.
+
+The converter reads chunks and processes one symbol at a time using temporary
+local storage. `--chunksize` controls CSV rows per chunk (default `100000`). Pass
+multiple paths after `--input` to merge downloads: identical candles are
+deduplicated and conflicting overlaps are rejected. Invalid OHLCV or non-minute
+timestamps stop conversion. Output files are published together after success;
+existing output directories are never overwritten. No Kite login is required.
+The module entry point is `python -m trading_system.data.kite_conversion`.
+
 ### Backtest locally downloaded Kite symbols
 
 In **Backtest dashboard**, choose **Saved Kite downloads** as the data source.
@@ -188,19 +241,96 @@ stocks; a separate benchmark download can be combined with stock downloads in
 this selector. Edit sectors under **Selected universe / sectors** if needed.
 The selected stocks form a fixed user-defined research universe.
 
+Click **Load selected data** to prepare the selection, then choose the research
+period and click **Run backtest**. Choosing the data source or editing selections
+reads only small metadata files, so large saved downloads do not block the controls.
+Preparation shows progress, reads minute CSVs in chunks, and uses temporary local
+storage to process one instrument at a time. Prepared data is reused for the browser
+session when changing strategy, portfolio, or date controls. Changing the selected
+folders, symbols, benchmark, sectors, timeframe, or saved files requires loading
+the selection again.
+
 The dashboard builds daily OHLCV and, for intraday/hybrid mode, five-minute OHLCV
 with bar-close timestamps from Kite's one-minute bar-start candles. It keeps only
-sessions with all 375 regular-market minutes from 09:15 through 15:29 and only
-dates shared by every selected stock and the benchmark. Incomplete/current sessions
-are excluded, with coverage shown in the sidebar. Missing prices are not filled.
+sessions with all 375 regular-market minutes from 09:15 through 15:29, independently
+for each stock, with daily benchmark coverage. A new listing or an incomplete
+session in one stock does not remove other stocks’ historical candles or warmup.
+Incomplete/current stock sessions are excluded individually, with coverage shown
+in the sidebar. Missing prices are not filled.
 Overlapping identical candles are deduplicated; conflicting overlaps are rejected.
 Provider prices are used without applying corporate-action adjustments.
 
-Choose the research period and click **Run backtest**. Earlier downloaded sessions
-remain available for warmup. Most strategies need at least 200 daily sessions;
-short downloads may run with no trades. The last completed run identifies its
+Earlier downloaded sessions remain available for warmup. Most strategies need
+at least 200 daily sessions; short downloads may run with no trades. The last completed run identifies its
 selected stocks and benchmark so changed controls cannot be mistaken for the
 previous results. No Kite login or network access is needed to backtest saved files.
+
+### Run on generated candles and inspect the backtest flow
+
+Choose **Generated Kite candles** to read the converter's existing `daily/` and
+`5minute/` files directly, avoiding another scan of the large minute download.
+Select the generated dataset, stocks and benchmark, set sectors, then click
+**Load selected data**. Keep **Execution timeframe = hybrid** to run all five
+strategies. Set the research period and click **Run backtest**.
+
+Daily history is preserved independently for each stock. Five-minute execution
+uses only complete 75-bar sessions for that stock; partial sessions are excluded
+without removing other stocks’ data. Intraday signals join each stock's own most
+recent daily screening row strictly before the session (maximum age seven days).
+No current-day daily close is available to an intraday strategy. Swing signals
+formed at a daily close execute on the next session's first five-minute bar.
+The benchmark retains its full daily warmup history. A stock needs its own
+indicator history: a recently listed stock cannot borrow another stock's warmup.
+
+After a run, use **Result screen**:
+
+- **Run diagnostics** shows enabled/skipped strategies, per-stock coverage and
+  warmup, screening exclusions, first failed trigger checks, and order outcomes.
+- **Daily screener** displays observed daily OHLCV, liquidity, moving averages,
+  ATR, relative strength/ranks, regime and each strategy's selection reason.
+  Choose a session, strategy, selection status and stocks, and download the
+  displayed rows. Warmup screening history is included. Intraday candidates
+  still require a five-minute trigger; selection alone does not place a trade.
+- **Stock trade details** shows each stock's trades and every triggered signal,
+  including rejected/unfilled/expired orders. Choose a signal to inspect its
+  exact indicator values, source daily screening candle, execution candles and
+  signal/entry/exit chart. `signal_id` links the order record to the closed trade.
+- **Portfolio and research** contains portfolio charts, attribution, the full
+  trade ledger, regimes, chronological validation and parameter comparisons.
+
+Progress bars identify data-loading, daily indicators/screening, five-minute
+indicators, each cost scenario's current timestamp/event count, signals, closed
+trades/open positions, validation runs and report export. Feature preparation is
+shared across slippage scenarios. **Prepare results ZIP** creates the download
+on demand, including `daily_screener.csv`, per-scenario `signals.csv` and
+`trigger_diagnostics.csv`, alongside the existing reports. CLI exports include
+the same audit tables.
+
+For example, on macOS/Linux:
+
+```bash
+.venv/bin/python -m trading_system.main --converted data/private/kite_converted/20261007_095613_e9187cdb_nifty100 --mode hybrid --output output/nifty100
+# Optionally restrict stocks and trading dates; earlier candles still warm indicators.
+.venv/bin/python -m trading_system.main --converted data/private/kite_converted/20261007_095613_e9187cdb_nifty100 --symbols RELIANCE TCS --mode hybrid --start 2024-01-01 --end 2025-12-31 --output output/selected
+```
+
+A zero-trade result is not forced into trading by relaxing strategy thresholds.
+Previously, intersecting every selected stock's dates could reduce a four-year
+NIFTY 100 download to just 33 daily sessions, below trend warmup. The loader now
+preserves each stock's history and the diagnostics distinguish insufficient
+history, failed strategy conditions, missing benchmark context, order expiry,
+and portfolio rejection. Daily mode runs two swing strategies; intraday mode
+runs three intraday strategies; hybrid runs both groups. Generated/provider
+candles are used as supplied, with no additional corporate-action adjustment.
+
+Opening Momentum requires a valid intraday benchmark VWAP. Kite's NIFTY index
+candles can report zero volume, making VWAP undefined. **Run diagnostics** marks
+this explicitly, and trigger checks identify `benchmark_vwap_unavailable`.
+The app does not invent volume or substitute a different confirmation rule;
+other strategies can continue. A volume-bearing benchmark input is required to
+evaluate that condition. Set actual sectors in the universe editor (or pass a
+`--universe` CSV to the converted-data CLI); `Unknown` stocks share one sector
+and its position limit, with these rejections reported explicitly.
 
 ### Download daily history with yfinance
 

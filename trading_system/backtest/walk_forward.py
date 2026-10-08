@@ -41,7 +41,9 @@ def windows(start, end, train_years=5, validate_years=1, step_years=1):
         cursor += pd.DateOffset(years=step_years)
 
 
-def evaluate_walk_forward(dataset, settings, folds, mode="daily", selector=None):
+def evaluate_walk_forward(
+    dataset, settings, folds, mode="daily", selector=None, progress=None
+):
     """Selector receives TRAIN-ONLY data. Frozen settings evaluate validation.
 
     No optimizer or final-test fitting is provided. Pre-validation data remains
@@ -50,7 +52,8 @@ def evaluate_walk_forward(dataset, settings, folds, mode="daily", selector=None)
     from trading_system.data.historical import Dataset
 
     results = []
-    for fold in folds:
+    folds = list(folds)
+    for i, fold in enumerate(folds):
         params = deepcopy(settings)
         if selector:
             begin, cutoff = (
@@ -85,7 +88,17 @@ def evaluate_walk_forward(dataset, settings, folds, mode="daily", selector=None)
             )
             params = selector(train, params)
         result = BacktestEngine(params).run(
-            dataset, start=fold.validation_start, end=fold.validation_end, mode=mode
+            dataset,
+            start=fold.validation_start,
+            end=fold.validation_end,
+            mode=mode,
+            progress=(
+                lambda f, m: progress(
+                    (i + f) / len(folds), f"Fold {i + 1}/{len(folds)} · {m}"
+                )
+            )
+            if progress
+            else None,
         )
         results.append(
             {
@@ -100,14 +113,34 @@ def evaluate_walk_forward(dataset, settings, folds, mode="daily", selector=None)
 
 
 def robustness(
-    dataset, settings, strategy, parameter, values, start=None, end=None, mode="daily"
+    dataset,
+    settings,
+    strategy,
+    parameter,
+    values,
+    start=None,
+    end=None,
+    mode="daily",
+    progress=None,
 ):
     if len(values) > 5:
         raise ValueError("Use at most five broad neighborhood values")
     rows = []
-    for value in values:
+    for i, value in enumerate(values):
         params = deepcopy(settings)
         params["strategies"][strategy][parameter] = value
-        r = BacktestEngine(params).run(dataset, start=start, end=end, mode=mode)
+        r = BacktestEngine(params).run(
+            dataset,
+            start=start,
+            end=end,
+            mode=mode,
+            progress=(
+                lambda f, m: progress(
+                    (i + f) / len(values), f"{parameter}={value} · {m}"
+                )
+            )
+            if progress
+            else None,
+        )
         rows.append({"parameter": parameter, "value": value, **metrics(r)})
     return pd.DataFrame(rows)

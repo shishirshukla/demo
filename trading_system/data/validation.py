@@ -13,6 +13,8 @@ def validate_bars(frame, intraday=False):
     frame["timestamp"] = (
         ts.dt.tz_localize(TZ) if ts.dt.tz is None else ts.dt.tz_convert(TZ)
     )
+    if frame.timestamp.isna().any():
+        raise ValueError("OHLCV contains missing timestamps")
     numeric = ["open", "high", "low", "close", "volume"]
     frame[numeric] = frame[numeric].apply(pd.to_numeric, errors="raise")
     if not np.isfinite(frame[numeric].to_numpy()).all():
@@ -29,7 +31,12 @@ def validate_bars(frame, intraday=False):
     if intraday:
         minute = frame.timestamp.dt.hour * 60 + frame.timestamp.dt.minute
         # Timestamps describe bar CLOSE: first complete five-minute bar is 09:20.
-        if ((minute < 560) | (minute > 930) | (minute % 5 != 0)).any():
+        if (
+            (minute < 560)
+            | (minute > 930)
+            | (minute % 5 != 0)
+            | frame.timestamp.ne(frame.timestamp.dt.floor("5min"))
+        ).any():
             raise ValueError("5-minute close timestamps must be 09:20–15:30 IST")
     else:
         frame["timestamp"] = frame.timestamp.dt.normalize() + pd.Timedelta(

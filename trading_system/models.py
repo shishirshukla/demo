@@ -70,3 +70,5 @@ class Trade:
     regime: str
     volatility_quartile: int
     liquidity_quartile: int
+    signal_time: pd.Timestamp | None = None
+    signal_id: int = 0

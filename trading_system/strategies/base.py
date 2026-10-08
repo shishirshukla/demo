@@ -1,6 +1,9 @@
 import math
 from abc import ABC, abstractmethod
 
+import numpy as np
+import pandas as pd
+
 from trading_system.models import Signal
 
 
@@ -19,6 +22,27 @@ class BaseStrategy(ABC):
 
     def exit_reason(self, position, row):
         return None
+
+    def daily_checks(self, frame, regime):
+        """Causal daily selection gates; intraday confirmations run separately."""
+        return {}
+
+    @staticmethod
+    def reasons(frame, checks):
+        reasons = np.full(len(frame), "selected", dtype=object)
+        for reason, passed in checks.items():
+            if np.isscalar(passed):
+                if not passed:
+                    reasons[reasons == "selected"] = reason
+            else:
+                values = passed.fillna(False).to_numpy(dtype=bool)
+                reasons[(reasons == "selected") & ~values] = reason
+        return pd.Series(reasons, index=frame.index)
+
+    def select(self, frame, checks):
+        reasons = self.reasons(frame, checks)
+        self.last_counts = reasons.value_counts().to_dict()
+        return frame.loc[reasons.eq("selected")]
 
     def make_signal(
         self,

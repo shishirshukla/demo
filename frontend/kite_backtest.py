@@ -6,16 +6,28 @@ import pandas as pd
 import streamlit as st
 
 from trading_system.data.kite_backtest import (
-    load_kite_candles,
-    prepare_kite_backtest,
+    prepare_saved_kite_backtest,
     saved_kite_datasets,
 )
 from trading_system.data.kite_downloader import STORAGE_ROOT
 
 
-@st.cache_data(show_spinner=False)
-def read_downloads(fingerprints):
-    return load_kite_candles([entry[0] for entry in fingerprints])
+def download_fingerprints(paths):
+    return tuple(
+        (
+            path,
+            *(
+                (stat.st_mtime_ns, stat.st_size)
+                for name in (
+                    "candles_1minute.csv",
+                    "instruments.csv",
+                    "download_manifest.json",
+                )
+                for stat in [(Path(path) / name).stat()]
+            ),
+        )
+        for path in paths
+    )
 
 
 def render_saved_kite_backtest(mode):
@@ -30,29 +42,23 @@ def render_saved_kite_backtest(mode):
         "Saved Kite datasets",
         list(catalog),
         default=[next(iter(catalog))],
-        format_func=lambda p: f"{Path(p).name} - {', '.join(catalog[p]['symbols'])}",
+        format_func=lambda p: (
+            f"{Path(p).name} - {len(catalog[p]['symbols'])} instruments"
+        ),
         help="Choose multiple downloads to combine stocks, benchmark, and warmup history. Identical overlapping candles are deduplicated.",
     )
     if not chosen:
         st.info("Select a saved dataset to see its downloaded symbols.")
         return None, None
     try:
-        fingerprints = tuple(
-            (
-                p,
-                *(
-                    (Path(p) / name).stat().st_mtime_ns
-                    for name in (
-                        "candles_1minute.csv",
-                        "instruments.csv",
-                        "download_manifest.json",
-                    )
-                ),
-            )
-            for p in chosen
+        fingerprints = download_fingerprints(chosen)
+        # Coverage and instrument metadata are small, even for multi-GB downloads.
+        # Do not read minute candles just to populate the selection widgets.
+        available = sorted({s for p in chosen for s in catalog[p]["symbols"]})
+        instruments = pd.concat(
+            [pd.read_csv(Path(p) / "instruments.csv") for p in chosen],
+            ignore_index=True,
         )
-        candles, instruments = read_downloads(fingerprints)
-        available = sorted(candles.symbol.unique())
         index_mask = (
             instruments.get("segment", pd.Series("", index=instruments.index))
             .fillna("")
@@ -108,22 +114,61 @@ def render_saved_kite_backtest(mode):
             or universe.sector.astype(str).str.strip().eq("").any()
         ):
             raise ValueError("Set a sector for each selected stock")
-        dataset, coverage = prepare_kite_backtest(
-            candles, symbols, benchmark, mode=mode, universe=universe
+        preparation_key = (
+            fingerprints,
+            tuple(symbols),
+            benchmark,
+            mode,
+            tuple(universe[["symbol", "sector"]].itertuples(index=False, name=None)),
         )
+        if st.button(
+            "Load selected data",
+            help="Prepare the selected stocks and benchmark for backtesting.",
+        ):
+            status = st.progress(0, text="Reading saved Kite data...")
+            try:
+                dataset, coverage = prepare_saved_kite_backtest(
+                    chosen,
+                    symbols,
+                    benchmark,
+                    mode=mode,
+                    universe=universe,
+                    progress=lambda fraction, message: status.progress(
+                        fraction, text=message
+                    ),
+                )
+                # Reject a result if a source changed during preparation.
+                if download_fingerprints(chosen) != fingerprints:
+                    raise ValueError(
+                        "Saved files changed while loading. Load the selected data again."
+                    )
+                st.session_state["kite_backtest_prepared"] = {
+                    "key": preparation_key,
+                    "dataset": dataset,
+                    "coverage": coverage,
+                }
+            finally:
+                status.empty()
+        prepared = st.session_state.get("kite_backtest_prepared")
+        if prepared is None or prepared["key"] != preparation_key:
+            st.info(
+                "Click Load selected data to set the research period and enable the backtest."
+            )
+            return None, None
+        dataset, coverage = prepared["dataset"], prepared["coverage"]
         st.caption(
-            f"{len(symbols)} stocks / {benchmark} / {coverage['common_sessions']} complete shared sessions / {coverage['first_session']} to {coverage['last_session']}"
+            f"{len(symbols)} stocks / {benchmark} / {coverage['available_sessions']} screening sessions / {coverage['first_session']} to {coverage['last_session']}"
         )
         if (
             coverage["excluded_incomplete_sessions"]
             or coverage["complete_sessions_outside_common_range"]
         ):
             st.warning(
-                "Incomplete sessions and dates without all selected stocks plus the benchmark were excluded."
+                "Incomplete stock sessions are excluded individually. Other stocks retain their valid history; missing bars are never filled."
             )
-        if coverage["common_sessions"] < 200:
+        if any(not row["warmup_200_ready"] for row in coverage["per_symbol"]):
             st.warning(
-                "Fewer than 200 daily sessions are available. Strategies needing daily warmup may produce no trades; add earlier downloads for warmup."
+                "Some stocks have fewer than 200 daily sessions. Strategies needing daily warmup may produce no trades; add earlier downloads for warmup."
             )
         st.caption(
             "Kite minute candles are aggregated into daily bars and five-minute bar-close candles. Provider prices are used as downloaded."

@@ -14,11 +14,11 @@ from .kite_downloader import (
     STORAGE_ROOT,
     TZ,
     api_error,
+    date_windows,
     download_kite_minutes,
     kite_client,
     local_time,
     nse_instruments,
-    request_bounds,
     save_kite_download,
     validate_request_delay,
 )
@@ -153,7 +153,7 @@ def main(argv=None, *, now=None):
         delay = validate_request_delay(args.delay)
         current = local_time(now) if now is not None else pd.Timestamp.now(tz=TZ)
         end = args.end or (current - pd.Timedelta(days=1)).date()
-        request_bounds(args.start, end, now=current)
+        windows = date_windows(args.start, end, now=current)
         if args.label and not re.fullmatch(r"[A-Za-z0-9_-]{1,60}", args.label):
             raise ValueError(
                 "Dataset label must use 1-60 letters, digits, underscores or hyphens."
@@ -183,6 +183,11 @@ def main(argv=None, *, now=None):
             flush=True,
         )
         print(f"Minimum request delay: {delay:g} seconds.", flush=True)
+        print(
+            f"{len(windows)} date batches per instrument x {len(selected)} instruments "
+            f"= {len(windows) * len(selected)} API requests.",
+            flush=True,
+        )
         result = download_kite_minutes(
             client,
             selected,

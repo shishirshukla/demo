@@ -8,11 +8,16 @@ from trading_system.indicators import atr, ema, percentile, rsi, sma, vwap
 from .corporate_actions import check_adjustments
 
 
-def daily_features(data, benchmark, settings):
+def daily_features(data, benchmark, settings, progress=None):
     check_adjustments(data)
     check_adjustments(benchmark)
     pieces = []
-    for _, group in data.groupby("symbol", sort=True):
+    groups = data.groupby("symbol", sort=True)
+    for i, (symbol, group) in enumerate(groups):
+        if progress:
+            progress(
+                i / len(groups), f"Daily indicators: {symbol} ({i + 1}/{len(groups)})"
+            )
         f = group.sort_values("timestamp").copy()
         for n in [20, 50, 200]:
             f[f"sma{n}"] = sma(f.close, n)
@@ -83,9 +88,15 @@ def eligible_rows(frame, universe, timestamp, settings):
     return f
 
 
-def intraday_features(data, settings):
+def intraday_features(data, settings, progress=None):
     pieces = []
-    for _, group in data.groupby("symbol", sort=True):
+    groups = data.groupby("symbol", sort=True)
+    for i, (symbol, group) in enumerate(groups):
+        if progress:
+            progress(
+                i / len(groups),
+                f"5-minute indicators: {symbol} ({i + 1}/{len(groups)})",
+            )
         f = group.sort_values("timestamp").copy().reset_index(drop=True)
         f["session"] = f.timestamp.dt.date
         f["minute"] = f.timestamp.dt.hour * 60 + f.timestamp.dt.minute

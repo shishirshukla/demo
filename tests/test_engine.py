@@ -83,6 +83,11 @@ def test_demo_reproducible_and_costed(tmp_path):
     )
     export_results([first], tmp_path, ds)
     assert (tmp_path / "slippage_5bps/monthly_returns.csv").exists()
+    assert (tmp_path / "daily_screener.csv").exists()
+    signals = pd.read_csv(tmp_path / "slippage_5bps/signals.csv")
+    assert len(signals) == len(first.signal_log)
+    assert "close" in json.loads(signals.features.iloc[0])
+    assert (tmp_path / "slippage_5bps/trigger_diagnostics.csv").exists()
 
 
 def test_invalid_data_and_incomplete_sessions():
@@ -94,6 +99,13 @@ def test_invalid_data_and_incomplete_sessions():
     ds.intraday = ds.intraday.iloc[1:]
     with pytest.raises(ValueError, match="complete"):
         BacktestEngine(load_settings()).run(ds, mode="intraday")
+
+
+def test_intraday_bars_require_exact_five_minute_closes():
+    ds = demo_dataset(sessions=20, intraday_sessions=1)
+    ds.intraday.loc[0, "timestamp"] += pd.Timedelta(seconds=30)
+    with pytest.raises(ValueError, match="5-minute close timestamps"):
+        BacktestEngine(load_settings()).run(ds, mode="hybrid")
 
 
 def test_walk_forward_chronological_and_train_isolated():
